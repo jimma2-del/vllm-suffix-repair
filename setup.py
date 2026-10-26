@@ -1525,6 +1525,12 @@ def get_requirements() -> list[str]:
         requirements = _read_requirements("xpu.txt")
     else:
         raise ValueError("Unsupported platform, please use CUDA, ROCm, or CPU.")
+
+
+    ### SUFFIX REPAIR Requirements
+    requirements += _read_requirements("suffix_repair.txt")
+    ### 
+
     return requirements
 
 

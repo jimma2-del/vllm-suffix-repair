@@ -1,0 +1,2 @@
+# Research-only dependencies for suffix repair; kept separate from upstream vLLM.
+datasets
