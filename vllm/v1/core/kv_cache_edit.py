@@ -26,10 +26,10 @@ class KVCacheEdit:
 
     block_size: int
     source: list[int]
-    scratch: list[int]
     destination: list[int]
     copy_end: int
     replacement_ids: list[int]
+    suffix_ids: list[int] | None  # None reuses the source suffix KV.
     start: int
     end: int
 
@@ -137,6 +137,8 @@ class KVCacheEditor:
         end: int,
         cache_salt: str | None,
         write: Callable[[KVCacheEdit], object],
+        *,
+        recompute_suffix: bool = False,
     ) -> str:
         if not 0 <= start <= end <= len(original_ids):
             raise ValueError("Expected 0 <= start <= end <= len(original_token_ids).")
@@ -157,31 +159,30 @@ class KVCacheEditor:
             source.append(blocks[0])
 
         num_pages = cdiv(edited.num_tokens, size)
-        # A length-preserving edit can also share pages beyond its last write.
+        # A reused, unshifted suffix can share whole source pages.
         changed_end = (
-            end if edited.num_tokens == len(original_ids) else edited.num_tokens
+            edited.num_tokens
+            if recompute_suffix or edited.num_tokens != len(original_ids)
+            else end
         )
         if changed_end == start:
             first = last = num_pages
         else:
             first, last = start // size, cdiv(changed_end, size)
-        num_scratch = cdiv(len(replacement_ids), size)
         self.pool.touch(source)
         allocated: list[KVCacheBlock] = []
         try:
-            allocated = self.pool.get_new_blocks(num_scratch + last - first)
-            destination = (
-                source[:first] + allocated[num_scratch:] + source[last:num_pages]
-            )
+            allocated = self.pool.get_new_blocks(last - first)
+            destination = source[:first] + allocated + source[last:num_pages]
             if first < last:
                 write(
                     KVCacheEdit(
                         block_size=size,
                         source=[b.block_id for b in source],
-                        scratch=[b.block_id for b in allocated[:num_scratch]],
                         destination=[b.block_id for b in destination],
                         copy_end=min(last * size, edited.num_tokens),
                         replacement_ids=replacement_ids,
+                        suffix_ids=original_ids[end:] if recompute_suffix else None,
                         start=start,
                         end=end,
                     )

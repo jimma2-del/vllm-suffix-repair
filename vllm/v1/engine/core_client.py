@@ -212,6 +212,7 @@ class EngineCoreClient(ABC):
         start: int,
         end: int,
         cache_salt: str | None,
+        recompute_suffix: bool = False,
     ) -> str:
         raise NotImplementedError
 
@@ -461,9 +462,10 @@ class InprocClient(EngineCoreClient):
         start: int,
         end: int,
         cache_salt: str | None,
+        recompute_suffix: bool = False,
     ) -> str:
         return self.engine_core.edit_kv_cache(
-            original_ids, replacement_ids, start, end, cache_salt
+            original_ids, replacement_ids, start, end, cache_salt, recompute_suffix
         )
 
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
@@ -1127,9 +1129,16 @@ class SyncMPClient(MPClient):
         start: int,
         end: int,
         cache_salt: str | None,
+        recompute_suffix: bool = False,
     ) -> str:
         return self.call_utility(
-            "edit_kv_cache", original_ids, replacement_ids, start, end, cache_salt
+            "edit_kv_cache",
+            original_ids,
+            replacement_ids,
+            start,
+            end,
+            cache_salt,
+            recompute_suffix,
         )
 
     def add_lora(self, lora_request: LoRARequest) -> bool:

@@ -844,12 +844,13 @@ class LLM(
         end: int,
         *,
         cache_salt: str | None = None,
+        recompute_suffix: bool = False,
     ) -> TokensPrompt:
-        """Splice separately prefilled text into a resident prompt's cached KV.
+        """Replace a token range in a resident prompt's cached KV.
 
+        The replacement attends to the cached prefix at its final positions.
         Uses the local GPU prefix cache of a dense, causal 1D RoPE decoder.
-        Source pages must still be resident. Changed pages and the replacement
-        prefill use space from the same block pool.
+        Source pages must still be resident and changed pages use the same pool.
 
         Args:
             original_token_ids: Exact token IDs of the cached text prompt,
@@ -859,13 +860,16 @@ class LLM(
             start: First token to replace (inclusive).
             end: First suffix token to keep (exclusive).
             cache_salt: Salt of the original prompt, including for chained edits.
+            recompute_suffix: Run a separate causal prefill of the suffix against
+                the cached prefix and replacement. Defaults to False, which reuses
+                the suffix KV and corrects its keys if their positions shift.
 
         Returns:
             Edited token IDs and a fresh cache salt. Pass the returned prompt
             to generate, or extend its IDs with continuation tokens. The salt
             selects the edited KV when the same text has other cached versions.
-            Suffix values retain their original context. An edit that deletes
-            every token returns an empty prompt with zero cache pages.
+            An edit that deletes every token returns an empty prompt with zero
+            cache pages.
 
         """
         original = list(original_token_ids)
@@ -879,7 +883,7 @@ class LLM(
             else []
         )
         salt = self.llm_engine.engine_core.edit_kv_cache(
-            original, replacement, start, end, cache_salt
+            original, replacement, start, end, cache_salt, recompute_suffix
         )
         return {
             "prompt_token_ids": original[:start] + replacement + original[end:],

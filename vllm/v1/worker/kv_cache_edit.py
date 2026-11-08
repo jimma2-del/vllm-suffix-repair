@@ -9,6 +9,7 @@ import torch
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_edit import KVCacheEdit
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
@@ -40,27 +41,32 @@ def _relocate_keys(
 
 def _prefill(
     runner: GPUModelRunner | GPUModelRunnerV2,
-    edit: KVCacheEdit,
+    token_ids: list[int],
+    start_pos: int,
+    pages: torch.Tensor,
+    block_size: int,
 ) -> None:
-    """Run causal prefill on scratch pages with document-relative positions."""
+    """Prefill a segment after the KV already present in the destination pages."""
+    if not token_ids:
+        return
     device = runner.device
     model = runner.get_model()
-    ids = torch.tensor(edit.replacement_ids, dtype=torch.long, device=device)
-    pages = torch.tensor(edit.scratch, dtype=torch.int32, device=device)
+    ids = torch.tensor(token_ids, dtype=torch.long, device=device)
+    pages = pages[: cdiv(start_pos + len(token_ids), block_size)].int()
     (kernel_size,) = prepare_kernel_block_sizes(
         runner.kv_cache_config, runner.attn_groups
     )
-    ratio = edit.block_size // kernel_size
+    ratio = block_size // kernel_size
     table = (
         pages[:, None] * ratio + torch.arange(ratio, dtype=pages.dtype, device=device)
     ).reshape(1, -1)
     chunk_size = runner.vllm_config.scheduler_config.max_num_batched_tokens
-    for start in range(0, len(ids), chunk_size):
-        end = min(start + chunk_size, len(ids))
-        count = end - start
-        positions = torch.arange(start, end, device=device)
-        slots = pages[positions // edit.block_size].long() * edit.block_size
-        slots += positions % edit.block_size
+    for chunk in ids.split(chunk_size):
+        count = chunk.numel()
+        end = start_pos + count
+        positions = torch.arange(start_pos, end, device=device)
+        slots = pages[positions // block_size].long() * block_size
+        slots += positions % block_size
         query_start = torch.tensor([0, count], dtype=torch.int32, device="cpu")
         seq_len = torch.tensor([end], dtype=torch.int32, device="cpu")
         slots = slots.unsqueeze(0)
@@ -87,7 +93,8 @@ def _prefill(
             slot_mapping=build_slot_mappings_by_layer(slots, runner.kv_cache_config),
             skip_compiled=True,
         ):
-            model(input_ids=ids[start:end], positions=positions)
+            model(input_ids=chunk, positions=positions)
+        start_pos = end
 
 
 def _copy_tokens(
@@ -144,25 +151,38 @@ def write_kv_cache_edit(
                 )
             layers.append((cache.transpose(1, 2), rope))
 
-    if edit.replacement_ids:
-        _prefill(runner, edit)
-    source, scratch, destination = (
+    source, destination = (
         torch.tensor(pages, dtype=torch.long, device=runner.device)
-        for pages in (edit.source, edit.scratch, edit.destination)
+        for pages in (edit.source, edit.destination)
     )
+    # Whole prefix pages are shared. Seed the prefix in the first private page
+    # for every layer before the replacement reads it.
     page_start = edit.start // edit.block_size * edit.block_size
-    inserted = len(edit.replacement_ids)
     for cache, rope in layers:
-        for pages, old, new, count in (
-            (source, page_start, page_start, edit.start - page_start),
-            (scratch, 0, edit.start, inserted),
-            (
-                source,
-                edit.end,
-                edit.start + inserted,
-                edit.copy_end - edit.start - inserted,
-            ),
-        ):
+        _copy_tokens(
+            cache,
+            rope,
+            edit.block_size,
+            source,
+            destination,
+            page_start,
+            page_start,
+            edit.start - page_start,
+        )
+
+    _prefill(runner, edit.replacement_ids, edit.start, destination, edit.block_size)
+    suffix_start = edit.start + len(edit.replacement_ids)
+    if edit.suffix_ids is not None:
+        _prefill(runner, edit.suffix_ids, suffix_start, destination, edit.block_size)
+    else:
+        for cache, rope in layers:
             _copy_tokens(
-                cache, rope, edit.block_size, pages, destination, old, new, count
+                cache,
+                rope,
+                edit.block_size,
+                source,
+                destination,
+                edit.end,
+                suffix_start,
+                edit.copy_end - suffix_start,
             )

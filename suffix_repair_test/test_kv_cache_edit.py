@@ -41,16 +41,40 @@ class KVCacheEditTest(unittest.TestCase):
 
     def test_equal_length_shares_only_untouched_pages(self):
         write = Mock()
-        # Even the same token IDs can have different KV after isolated prefill.
-        salt = self.editor.edit(self.ids, self.ids[5:7], 5, 7, "source", write)
+        replacement = [91, 92]
+        edited_ids = self.ids[:5] + replacement + self.ids[7:]
+        salt = self.editor.edit(self.ids, replacement, 5, 7, "source", write)
         plan = write.call_args.args[0]
-        self.assertEqual(plan.destination, self.lookup(self.ids, salt))
+        self.assertEqual(plan.destination, self.lookup(edited_ids, salt))
         self.assertEqual(plan.source, self.lookup(self.ids, "source"))
+        self.assertIsNone(plan.suffix_ids)
         self.assertEqual(plan.destination[:1], plan.source[:1])
         self.assertNotEqual(plan.destination[1], plan.source[1])
         self.assertEqual(plan.destination[2:], plan.source[2:])
         self.assertEqual(plan.copy_end, 8)
         self.assertEqual([b.ref_cnt for b in self.pages], [1] * len(self.pages))
+
+    def test_recompute_privatizes_the_whole_suffix(self):
+        for end, replacement in ((7, [91, 92]), (7, []), (5, [])):
+            with self.subTest(end=end, replacement=replacement):
+                write = Mock()
+                salt = self.editor.edit(
+                    self.ids,
+                    replacement,
+                    5,
+                    end,
+                    "source",
+                    write,
+                    recompute_suffix=True,
+                )
+                plan = write.call_args.args[0]
+                edited_ids = self.ids[:5] + replacement + self.ids[end:]
+                self.assertEqual(plan.destination, self.lookup(edited_ids, salt))
+                self.assertEqual(plan.suffix_ids, self.ids[end:])
+                self.assertEqual(plan.copy_end, len(edited_ids))
+                self.assertEqual(plan.source[0], plan.destination[0])
+                self.assertTrue(set(plan.source).isdisjoint(plan.destination[1:]))
+                self.assertTrue(all(b.ref_cnt == 1 for b in self.pages))
 
     def test_insert_delete_truncate_and_noop(self):
         for start, end, ids in [

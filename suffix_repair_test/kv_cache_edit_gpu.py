@@ -64,49 +64,119 @@ def main(model_path: str) -> None:
             ].clone()
         return states, pages
 
-    original = list(range(100, 139))
+    # Both the replacement and the suffix cross the 64-token prefill chunk size.
+    original = list(range(100, 195))
     start, end = 19, 22
     text = " one two three four five six seven eight nine ten" * 7
     inserted = llm.get_tokenizer().encode(text, add_special_tokens=False)
-    llm.generate(
-        {"prompt_token_ids": original},
+    suffix_start = start + len(inserted)
+    edited_ids = original[:start] + inserted + original[end:]
+    # Use ordinary generation with partial-page hits so the reference has the
+    # same cached prefix and FP16 forward shapes as the two edit passes.
+    reference_salt = editor.salt_prefix + "reference"
+
+    def generate_reference(ids, hit, sampling=params):
+        output = llm.generate(
+            {"prompt_token_ids": ids, "cache_salt": reference_salt},
+            sampling,
+            use_tqdm=False,
+        )[0]
+        assert output.num_cached_tokens == hit, output.num_cached_tokens
+
+    generate_reference(original[:start], 0)
+    generate_reference(
+        original,
+        start,
         SamplingParams(max_tokens=12, temperature=0, ignore_eos=True),
-        use_tqdm=False,
     )
-    llm.generate({"prompt_token_ids": inserted}, params, use_tqdm=False)
-    before, source = snapshot(original)
-    standalone, _ = snapshot(inserted)
+    generate_reference(edited_ids[:suffix_start], start)
+    generate_reference(edited_ids, suffix_start)
+    before, source = snapshot(original, reference_salt)
+    reference, _ = snapshot(edited_ids, reference_salt)
+
+    forwards = []
+
+    def record_positions(module, args, kwargs):
+        forwards.append(kwargs["positions"].tolist())
 
     # Hold a reader of every page throughout the edit.
     editor.pool.touch(source)
     try:
-        result = llm.edit_kv_cache(original, text, start, end)
-        edited_ids, salt = result["prompt_token_ids"], result["cache_salt"]
-        assert edited_ids == original[:start] + inserted + original[end:]
-        after, dest = snapshot(edited_ids, salt)
-        original_again, _ = snapshot(original)
-        assert dest[0] is source[0]
-        assert not {b.block_id for b in source} & {b.block_id for b in dest[1:]}
+        with model.register_forward_pre_hook(record_positions, with_kwargs=True):
+            result = llm.edit_kv_cache(
+                original, text, start, end, cache_salt=reference_salt
+            )
+            assert [p for chunk in forwards for p in chunk] == list(
+                range(start, suffix_start)
+            )
+            forwards.clear()
+            repaired = llm.edit_kv_cache(
+                original,
+                text,
+                start,
+                end,
+                cache_salt=reference_salt,
+                recompute_suffix=True,
+            )
+            assert [p for chunk in forwards for p in chunk] == list(
+                range(start, len(edited_ids))
+            )
+            assert any(chunk[0] == suffix_start for chunk in forwards)
+        assert result["prompt_token_ids"] == repaired["prompt_token_ids"] == edited_ids
+        assert result["cache_salt"] != repaired["cache_salt"]
+        after, dest = snapshot(edited_ids, result["cache_salt"])
+        repaired_kv, repaired_pages = snapshot(edited_ids, repaired["cache_salt"])
+        original_again, _ = snapshot(original, reference_salt)
+        for pages in (dest, repaired_pages):
+            assert pages[0] is source[0]
+            assert not {b.block_id for b in source} & {b.block_id for b in pages[1:]}
         for name, kv in after.items():
             torch.testing.assert_close(
                 original_again[name], before[name], rtol=0, atol=0
             )
             torch.testing.assert_close(kv[:start], before[name][:start], rtol=0, atol=0)
+            torch.testing.assert_close(
+                kv[:suffix_start], repaired_kv[name][:suffix_start], rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                repaired_kv[name][start:],
+                reference[name][start:],
+                rtol=0,
+                atol=0,
+                msg=lambda msg, name=name: f"{name}: {msg}",
+            )
             rope = model.get_submodule(name.rsplit(".", 1)[0]).rotary_emb
-            for source_kv, src_pos, dst_pos in (
-                (standalone[name], 0, start),
-                (before[name][end:], end, start + len(inserted)),
-            ):
-                actual = kv[dst_pos : dst_pos + len(source_kv)]
-                check_relocated(source_kv, actual, src_pos, dst_pos, rope)
+            check_relocated(
+                before[name][end:], kv[suffix_start:], end, suffix_start, rope
+            )
     finally:
         editor.pool.free_blocks(source)
 
-    extended = dict(result, prompt_token_ids=edited_ids + [42])
-    output = llm.generate(extended, params, use_tqdm=False)[0]
-    assert output.num_cached_tokens == len(edited_ids), output.num_cached_tokens
+    # Repair the previously reused suffix without changing any token IDs.
+    refreshed = llm.edit_kv_cache(
+        edited_ids,
+        "",
+        suffix_start,
+        suffix_start,
+        cache_salt=result["cache_salt"],
+        recompute_suffix=True,
+    )
+    refreshed_kv, _ = snapshot(edited_ids, refreshed["cache_salt"])
+    reused_again, _ = snapshot(edited_ids, result["cache_salt"])
+    for name in after:
+        torch.testing.assert_close(reused_again[name], after[name], atol=0, rtol=0)
+        torch.testing.assert_close(
+            refreshed_kv[name], repaired_kv[name], atol=0, rtol=0
+        )
+
+    for prompt in (result, repaired):
+        extended = dict(prompt, prompt_token_ids=edited_ids + [42])
+        output = llm.generate(extended, params, use_tqdm=False)[0]
+        assert output.num_cached_tokens == len(edited_ids), output.num_cached_tokens
     # A second edit resolves the first edit's partial tail by its salt.
-    shortened = llm.edit_kv_cache(edited_ids, "", 3, 32, cache_salt=salt)
+    shortened = llm.edit_kv_cache(
+        edited_ids, "", 3, 32, cache_salt=result["cache_salt"]
+    )
     short_ids = shortened["prompt_token_ids"]
     assert short_ids == edited_ids[:3] + edited_ids[32:]
     short_kv, _ = snapshot(short_ids, shortened["cache_salt"])
@@ -118,7 +188,7 @@ def main(model_path: str) -> None:
     assert output.num_cached_tokens == len(short_ids) - 1, output.num_cached_tokens
     print(
         f"Checked {len(after)} layers, {len(original)} -> {len(edited_ids)}"
-        f" -> {len(short_ids)} tokens, including partial-page generation hits."
+        f" -> {len(short_ids)} tokens, with suffix reuse and recomputation."
     )
 
 

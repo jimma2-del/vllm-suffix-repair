@@ -914,6 +914,7 @@ class EngineCore:
         start: int,
         end: int,
         cache_salt: str | None,
+        recompute_suffix: bool = False,
     ) -> str:
         manager = getattr(self.scheduler, "kv_cache_manager", None)
         editor = getattr(manager, "editor", None)
@@ -938,6 +939,7 @@ class EngineCore:
             end,
             cache_salt,
             lambda plan: self.collective_rpc("write_kv_cache_edit", args=(plan,)),
+            recompute_suffix=recompute_suffix,
         )
 
     def _set_kv_connector_handshake_metadata(self) -> None:
