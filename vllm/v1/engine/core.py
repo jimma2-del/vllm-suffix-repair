@@ -223,6 +223,16 @@ class EngineCore:
             self.request_block_hasher = get_request_block_hasher(
                 hash_block_size, caching_hash_fn
             )
+            cache_manager = getattr(self.scheduler, "kv_cache_manager", None)
+            if cache_manager is not None:
+                from vllm.v1.core.kv_cache_edit import KVCacheEditor
+
+                cache_manager.editor = KVCacheEditor.for_config(
+                    vllm_config,
+                    kv_cache_config,
+                    cache_manager.block_pool,
+                    caching_hash_fn,
+                )
 
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
@@ -896,6 +906,39 @@ class EngineCore:
         self.scheduler.reset_encoder_cache()
         # Reset the GPU model runner's encoder cache (physical storage)
         self.model_executor.reset_encoder_cache()
+
+    def edit_kv_cache(
+        self,
+        original_ids: list[int],
+        replacement_ids: list[int],
+        start: int,
+        end: int,
+        cache_salt: str | None,
+    ) -> str:
+        manager = getattr(self.scheduler, "kv_cache_manager", None)
+        editor = getattr(manager, "editor", None)
+        if editor is None:
+            raise ValueError(
+                "KV editing requires local prefix caching with one unquantized, "
+                "dense causal attention group and no speculative decoding or LoRA."
+            )
+        length = len(original_ids) - (end - start) + len(replacement_ids)
+        config = self.vllm_config.model_config
+        if max(length, len(original_ids)) > config.max_model_len:
+            raise ValueError("The original or edited prompt exceeds max_model_len.")
+        vocab_size = config.get_vocab_size()
+        if any(t < 0 or t >= vocab_size for t in replacement_ids):
+            raise ValueError(
+                "Replacement contains a token outside the model vocabulary."
+            )
+        return editor.edit(
+            original_ids,
+            replacement_ids,
+            start,
+            end,
+            cache_salt,
+            lambda plan: self.collective_rpc("write_kv_cache_edit", args=(plan,)),
+        )
 
     def _set_kv_connector_handshake_metadata(self) -> None:
         # If a KV connector is initialized for scheduler, we want to collect

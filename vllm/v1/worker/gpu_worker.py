@@ -158,6 +158,7 @@ def maybe_rocm_profiling_fallback(profile_result: MemoryProfilingResult) -> int 
 if TYPE_CHECKING:
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
+    from vllm.v1.core.kv_cache_edit import KVCacheEdit
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -1154,6 +1155,18 @@ class Worker(WorkerBase):
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
+
+    def write_kv_cache_edit(self, edit: "KVCacheEdit") -> None:
+        from vllm.config import set_current_vllm_config
+        from vllm.v1.worker.kv_cache_edit import write_kv_cache_edit
+
+        self.synchronize_device()
+        try:
+            with set_current_vllm_config(self.vllm_config):
+                write_kv_cache_edit(self.model_runner, edit)
+        finally:
+            # The scheduler can recycle these pages as soon as this RPC returns.
+            self.synchronize_device()
 
     def get_draft_model(self) -> nn.Module | None:
         return self.model_runner.get_draft_model()

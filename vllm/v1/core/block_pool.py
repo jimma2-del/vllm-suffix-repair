@@ -290,8 +290,15 @@ class BlockPool:
                     blk.block_hash_num_tokens is not None
                     and blk.block_hash_num_tokens < num_hash_tokens
                 )
-                removed_hashes = self._remove_cached_block_hashes(blk)
-                self._emit_block_removed_events(removed_hashes)
+                if block_size == self.hash_block_size:
+                    # A dense prompt tail remains valid as decode fills the page.
+                    self.cached_block_hashes_by_block.setdefault(
+                        blk.block_id, set()
+                    ).add(blk.block_hash)
+                    blk.reset_hash()
+                else:
+                    removed_hashes = self._remove_cached_block_hashes(blk)
+                    self._emit_block_removed_events(removed_hashes)
             self._insert_block_hash(
                 block_hash_with_group_id,
                 blk,
@@ -443,6 +450,38 @@ class BlockPool:
                 block_size=block_size,
                 kv_cache_group_id=kv_cache_group_id,
                 extra_keys_list=extra_keys_list,
+            )
+        )
+
+    def cache_block_alias(
+        self, request: Request, block: KVCacheBlock, block_hash: BlockHash, end: int
+    ) -> None:
+        """Index a dense edit page (or its valid prefix) in local cache group 0."""
+        key = make_block_hash_with_group_id(block_hash, 0)
+        if self.cached_block_hash_to_block.contain(key, block.block_id):
+            return
+        self._insert_block_hash(key, block, num_tokens=end)
+        if self.enable_kv_cache_events:
+            self.emit_block_alias_event(request, block_hash, end)
+
+    def emit_block_alias_event(
+        self, request: Request, block_hash: BlockHash, end: int
+    ) -> None:
+        page = (end - 1) // self.hash_block_size
+        start = page * self.hash_block_size
+        extra, _ = generate_block_hash_extra_keys(request, start, end, 0)
+        self.kv_event_queue.append(
+            self._build_block_stored_event(
+                request,
+                [maybe_convert_block_hash(block_hash)],
+                maybe_convert_block_hash(request.block_hashes[page - 1])
+                if page
+                else None,
+                start,
+                end,
+                end - start,
+                0,
+                [extra],
             )
         )
 

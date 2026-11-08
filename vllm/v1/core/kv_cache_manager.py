@@ -13,6 +13,7 @@ from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     get_kv_cache_coordinator,
 )
+from vllm.v1.core.kv_cache_edit import KVCacheEditor
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy, trim_null_head
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
@@ -195,6 +196,7 @@ class KVCacheManager:
                     manager.shared_prefix_checkpoint = True
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
+        self.editor: KVCacheEditor | None = None
         self.retained_hit_group_ids = tuple(
             manager.kv_cache_group_id
             for manager in self.coordinator.single_type_managers
@@ -265,7 +267,7 @@ class KVCacheManager:
         self, request: Request, max_cache_hit_length: int | None = None
     ) -> tuple[KVCacheBlocks, int, int]:
         """Get the computed (cached) blocks for the request.
-        Note that the computed blocks must be full.
+        The final block can be a partial prefix-cache hit.
 
         Args:
             request: The request to get the computed blocks.
@@ -292,10 +294,8 @@ class KVCacheManager:
 
         # NOTE: When all tokens hit the cache, we must recompute the last token
         # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
-        # This can trigger recomputation of an entire block, rather than just
-        # the single last token, because allocate_slots() requires
-        # num_computed_tokens to be block-size aligned. Removing this limitation
-        # could slightly improve performance in the future.
+        # With only block-aligned cache entries this can require another block
+        # of prefill. An edited prompt also indexes its last logit boundary.
         if max_cache_hit_length is None:
             max_cache_hit_length = request.num_tokens - 1
         computed_blocks, num_new_computed_tokens, num_uncached = (
@@ -313,6 +313,18 @@ class KVCacheManager:
             and getattr(request, "kv_cache_report_mode", "incremental") == "full"
         ):
             self.coordinator.emit_cached_block_events(request, computed_blocks)
+
+        if (
+            self.editor is not None
+            and request.cache_salt
+            and request.cache_salt.startswith(self.editor.salt_prefix)
+        ):
+            num_new_computed_tokens = self.editor.extend_hit(
+                request,
+                computed_blocks[0],
+                num_new_computed_tokens,
+                max_cache_hit_length,
+            )
 
         # The junction to pin is where the lagging sparse-retention group stops
         # (``num_new_computed_tokens``) plus the uncached shared prefix -- i.e.
@@ -621,6 +633,15 @@ class KVCacheManager:
             request.num_tokens,
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        if (
+            self.editor is not None
+            and total_computed_tokens < request.num_prompt_tokens <= num_tokens_to_cache
+        ):
+            self.editor.cache_tail(
+                request,
+                request.num_prompt_tokens,
+                self.coordinator.get_blocks(request.request_id)[0],
+            )
 
         return self.create_kv_cache_blocks(new_blocks)
 
@@ -633,7 +654,20 @@ class KVCacheManager:
             request: The request to free the blocks.
 
         """
+        self._cache_finished_edit_tail(request)
         self.coordinator.free(request.request_id)
+
+    def _cache_finished_edit_tail(self, request: Request) -> None:
+        if self.editor is None:
+            return
+        end = min(
+            request.num_tokens,
+            request.num_computed_tokens - request.num_in_flight_tokens,
+        )
+        if end > request.num_prompt_tokens and end % self.editor.block_size:
+            blocks = self.coordinator.get_blocks(request.request_id)[0]
+            if len(blocks) > end // self.editor.block_size:
+                self.editor.cache_tail(request, end, blocks)
 
     def remove_skipped_blocks(
         self,
@@ -667,6 +701,7 @@ class KVCacheManager:
             The request's blocks in allocation order.
 
         """
+        self._cache_finished_edit_tail(request)
         return self.coordinator.pop_blocks_for_free(request.request_id)
 
     def evict_blocks(self, block_ids: set[int]) -> None:

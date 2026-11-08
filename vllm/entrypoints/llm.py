@@ -33,7 +33,7 @@ from vllm.entrypoints.common.startup import log_non_default_args
 from vllm.entrypoints.generate.beam_search.offline import BeamSearchOfflineMixin
 from vllm.entrypoints.pooling.offline import PoolingOfflineMixin
 from vllm.entrypoints.rl.offline import RLOfflineMixin
-from vllm.inputs import PromptType
+from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import configure_logging_if_needed, init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -835,6 +835,56 @@ class LLM(
         return self.llm_engine.reset_prefix_cache(
             reset_running_requests, reset_connector
         )
+
+    def edit_kv_cache(
+        self,
+        original_token_ids: Sequence[int],
+        new_tokens: str,
+        start: int,
+        end: int,
+        *,
+        cache_salt: str | None = None,
+    ) -> TokensPrompt:
+        """Splice separately prefilled text into a resident prompt's cached KV.
+
+        Uses the local GPU prefix cache of a dense, causal 1D RoPE decoder.
+        Source pages must still be resident. Changed pages and the replacement
+        prefill use space from the same block pool.
+
+        Args:
+            original_token_ids: Exact token IDs of the cached text prompt,
+                including any special tokens used when it was first submitted.
+            new_tokens: Replacement text, tokenized without added special tokens.
+                An empty string deletes the selected range.
+            start: First token to replace (inclusive).
+            end: First suffix token to keep (exclusive).
+            cache_salt: Salt of the original prompt, including for chained edits.
+
+        Returns:
+            Edited token IDs and a fresh cache salt. Pass the returned prompt
+            to generate, or extend its IDs with continuation tokens. The salt
+            selects the edited KV when the same text has other cached versions.
+            Suffix values retain their original context. An edit that deletes
+            every token returns an empty prompt with zero cache pages.
+
+        """
+        original = list(original_token_ids)
+        if not isinstance(new_tokens, str):
+            raise TypeError("new_tokens must be a string.")
+        if not 0 <= start <= end <= len(original):
+            raise ValueError("Expected 0 <= start <= end <= len(original_token_ids).")
+        replacement = (
+            self.get_tokenizer().encode(new_tokens, add_special_tokens=False)
+            if new_tokens
+            else []
+        )
+        salt = self.llm_engine.engine_core.edit_kv_cache(
+            original, replacement, start, end, cache_salt
+        )
+        return {
+            "prompt_token_ids": original[:start] + replacement + original[end:],
+            "cache_salt": salt,
+        }
 
     def sleep(self, level: int = 1, mode: PauseMode = "abort"):
         """Put the engine to sleep. The engine should not process any requests.

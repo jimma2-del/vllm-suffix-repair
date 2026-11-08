@@ -205,6 +205,16 @@ class EngineCoreClient(ABC):
     def reset_encoder_cache(self) -> None:
         raise NotImplementedError
 
+    def edit_kv_cache(
+        self,
+        original_ids: list[int],
+        replacement_ids: list[int],
+        start: int,
+        end: int,
+        cache_salt: str | None,
+    ) -> str:
+        raise NotImplementedError
+
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         raise NotImplementedError
 
@@ -443,6 +453,18 @@ class InprocClient(EngineCoreClient):
 
     def reset_encoder_cache(self) -> None:
         self.engine_core.reset_encoder_cache()
+
+    def edit_kv_cache(
+        self,
+        original_ids: list[int],
+        replacement_ids: list[int],
+        start: int,
+        end: int,
+        cache_salt: str | None,
+    ) -> str:
+        return self.engine_core.edit_kv_cache(
+            original_ids, replacement_ids, start, end, cache_salt
+        )
 
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         if mode == "wait":
@@ -1097,6 +1119,18 @@ class SyncMPClient(MPClient):
 
     def reset_encoder_cache(self) -> None:
         self.call_utility("reset_encoder_cache")
+
+    def edit_kv_cache(
+        self,
+        original_ids: list[int],
+        replacement_ids: list[int],
+        start: int,
+        end: int,
+        cache_salt: str | None,
+    ) -> str:
+        return self.call_utility(
+            "edit_kv_cache", original_ids, replacement_ids, start, end, cache_salt
+        )
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.call_utility("add_lora", lora_request)
