@@ -10,6 +10,7 @@ from vllm.distributed.kv_transfer import (
     is_v1_kv_transfer_group,
 )
 from vllm.utils.torch_utils import _resolve_layer_name
+from vllm.v1.attention.ops.query_cache import get_cache_pages
 
 
 def maybe_transfer_kv_layer(func: Callable) -> Callable:
@@ -42,7 +43,7 @@ def maybe_transfer_kv_layer(func: Callable) -> Callable:
         layer_name = _resolve_layer_name(args[layer_name_index])
 
         # Extract attention context (metadata, layer, kv_cache, layer_slot_mapping)
-        attn_metadata, _, kv_cache, _ = get_attention_context(layer_name)
+        attn_metadata, layer, _, _ = get_attention_context(layer_name)
         connector = get_kv_transfer_group()
         if attn_metadata is None or not connector.has_connector_metadata():
             return func(*args, **kwargs)
@@ -54,7 +55,7 @@ def maybe_transfer_kv_layer(func: Callable) -> Callable:
         result = func(*args, **kwargs)
 
         # Save KV cache layer on exit
-        connector.save_kv_layer(layer_name, kv_cache, attn_metadata)
+        connector.save_kv_layer(layer_name, get_cache_pages(layer), attn_metadata)
 
         return result
 

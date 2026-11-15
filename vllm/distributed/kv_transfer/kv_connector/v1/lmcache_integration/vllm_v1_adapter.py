@@ -54,7 +54,9 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_kv_cache_torch_dtype
 from vllm.v1.attention.backend import AttentionMetadata
+from vllm.v1.attention.ops.query_cache import get_cache_pages
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import AttentionSpec, iter_layer_specs
 from vllm.version import __version__ as VLLM_VERSION
 
 if TYPE_CHECKING:
@@ -62,6 +64,7 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import PlaceholderRange
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.core.sched.output import NewRequestData
+    from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -434,6 +437,7 @@ def _calculate_mtp_layers(vllm_config, model_config):
 def _init_lmcache_engine(
     lmcache_config: LMCacheEngineConfig,
     vllm_config: "VllmConfig",
+    kv_cache_config: "KVCacheConfig",
 ) -> LMCacheEngine:
     """Initialize the LMCache engine by the given model config and parallel
     config. This function will check the environment variable
@@ -443,6 +447,7 @@ def _init_lmcache_engine(
     Args:
         lmcache_config: The LMCache configuration.
         vllm_config: The vLLM configuration.
+        kv_cache_config: The allocated cache geometry.
 
     Returns:
         The initialized LMCache engine
@@ -475,6 +480,23 @@ def _init_lmcache_engine(
     chunk_size = lmcache_config.chunk_size
     num_kv_head = model_config.get_num_kv_heads(parallel_config)
     head_size = model_config.get_head_size()
+    model_name = model_config.model
+    if kv_cache_config.has_query_cache:
+        widths = {
+            spec.num_heads * spec.state_content_size_bytes
+            for group in kv_cache_config.transfer_groups
+            for spec in iter_layer_specs(group.kv_cache_spec)
+            if isinstance(spec, AttentionSpec)
+        }
+        if len(widths) != 1 or use_mla:
+            raise ValueError("LMCache requires a uniform per-layer query/KV record.")
+        side_elements, extra = divmod(widths.pop(), 2 * kv_dtype.itemsize)
+        if extra:
+            raise ValueError("LMCache requires equal-size K and V storage planes.")
+        num_kv_head, extra = divmod(side_elements, head_size)
+        if extra:
+            num_kv_head, head_size = 1, side_elements
+        model_name = f"{model_name}@q-{cache_config.q_cache_dtype}"
     kv_shape = (num_layer, 1 if use_mla else 2, chunk_size, num_kv_head, head_size)
     logger.info(
         "use mla: %s, kv shape: %s, num_mtp_layers: %s",
@@ -490,7 +512,7 @@ def _init_lmcache_engine(
     torch.accelerator.set_device_index(device_index)
     device = torch.device(f"cuda:{device_index}")
     metadata = LMCacheEngineMetadata(
-        model_config.model,
+        model_name,
         parallel_config.world_size,
         parallel_config.rank,
         "vllm",
@@ -620,6 +642,7 @@ class LMCacheConnectorV1Impl:
             self.lmcache_engine = _init_lmcache_engine(
                 config,
                 vllm_config,
+                parent._kv_cache_config,
             )
 
             self.use_layerwise = config.use_layerwise
@@ -784,7 +807,7 @@ class LMCacheConnectorV1Impl:
                 continue
 
             if layer_name not in self.kv_caches:
-                self.kv_caches[layer_name] = attn_layer.kv_cache
+                self.kv_caches[layer_name] = get_cache_pages(attn_layer)
 
     ####################
     # Worker side APIs

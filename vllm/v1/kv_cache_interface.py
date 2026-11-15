@@ -549,6 +549,8 @@ class AttentionSpec(KVCacheSpec):
     """H of the logical ``[B, H, N, C]`` page when packing diverges from one
     slot per KV head. None means one slot per KV head. Published by the backend.
     """
+    query_bytes_per_token: int = 0
+    """Query payload for this layer and its KV-sharing consumers."""
     state_content_bytes: int | None = None
     """C in bytes when packed; None means dense K/V content."""
     tokens_per_state: int | Fraction = 1
@@ -563,9 +565,12 @@ class AttentionSpec(KVCacheSpec):
 
     @property
     def num_heads(self) -> int:
-        if self.num_head_slots is not None:
-            return self.num_head_slots
-        return self.num_kv_heads
+        kv_heads = self.num_head_slots or self.num_kv_heads
+        if not self.query_bytes_per_token:
+            return kv_heads
+        return kv_heads + cdiv(
+            self.query_bytes_per_token, self.state_content_size_bytes
+        )
 
     @property
     def state_content_size_bytes(self) -> int:
@@ -676,6 +681,7 @@ class FullAttentionSpec(AttentionSpec):
             max_tp_shards=specs[0].max_tp_shards,
             page_size_padded=specs[0].page_size_padded,
             num_head_slots=specs[0].num_head_slots,
+            query_bytes_per_token=specs[0].query_bytes_per_token,
             state_content_bytes=specs[0].state_content_bytes,
             tokens_per_state=specs[0].tokens_per_state,
             sliding_window=cls.merge_window_sizes(sliding_window),
@@ -833,6 +839,7 @@ class RSWASpec(FullAttentionSpec):
             max_tp_shards=base.max_tp_shards,
             page_size_padded=base.page_size_padded,
             num_head_slots=base.num_head_slots,
+            query_bytes_per_token=base.query_bytes_per_token,
             state_content_bytes=base.state_content_bytes,
             tokens_per_state=base.tokens_per_state,
             sliding_window=base.sliding_window,
@@ -1245,6 +1252,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             max_tp_shards=specs[0].max_tp_shards,
             page_size_padded=specs[0].page_size_padded,
             num_head_slots=specs[0].num_head_slots,
+            query_bytes_per_token=specs[0].query_bytes_per_token,
             state_content_bytes=specs[0].state_content_bytes,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
@@ -1539,6 +1547,15 @@ class KVCacheConfig:
     """Consecutive TP ranks holding identical KV for every layer (1: none)."""
 
     @cached_property
+    def has_query_cache(self) -> bool:
+        """Whether transferable pages contain decoder query records."""
+        return any(
+            isinstance(spec, AttentionSpec) and spec.query_bytes_per_token > 0
+            for group in self.transfer_groups
+            for spec in iter_layer_specs(group.kv_cache_spec)
+        )
+
+    @cached_property
     def transfer_group_ids(self) -> tuple[int, ...]:
         """IDs of cache groups that participate in external KV transfer."""
         return tuple(
@@ -1635,6 +1652,11 @@ class KVCacheConfig:
         Required for Mamba layers, whose state is read before it is fully written
         (#35219), and for mixed-precision caches, where a block reused across
         groups can be reinterpreted under a different precision and decode stale
-        bytes to NaN/Inf. Uniform-precision caches skip zeroing.
+        bytes to NaN/Inf. Groups sharing a pool with query records can place
+        query bytes in another group's KV region.
         """
-        return self.has_mamba_layers or self.has_mixed_precision_kv_cache
+        return (
+            self.has_mamba_layers
+            or self.has_mixed_precision_kv_cache
+            or (len(self.kv_cache_groups) > 1 and self.has_query_cache)
+        )

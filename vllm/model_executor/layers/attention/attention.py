@@ -44,6 +44,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.ops.query_cache import QueryCache
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -444,6 +445,17 @@ class Attention(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
         self.attn_type = attn_type
+        q_dtype = vllm_config.cache_config.q_cache_dtype
+        self.query_cache = (
+            QueryCache(
+                q_dtype,
+                num_heads,
+                head_size,
+                vllm_config.parallel_config.decode_context_parallel_size,
+            )
+            if attn_type == AttentionType.DECODER and q_dtype != "none"
+            else None
+        )
 
         if kv_sharing_target_layer_name is not None:
             validate_kv_sharing_target(
@@ -508,6 +520,7 @@ class Attention(nn.Module, AttentionLayerBase):
         """
         if output_dtype is None:
             output_dtype = query.dtype
+        query_for_cache = None
         if self.query_quant is not None:
             # quantizing with a simple torch operation enables
             # torch.compile to fuse this into previous ops
@@ -520,6 +533,8 @@ class Attention(nn.Module, AttentionLayerBase):
 
             # check if query quantization is supported
             if self.impl.supports_quant_query_input:
+                if self.query_cache is not None:
+                    query_for_cache = query
                 query, _ = self.query_quant(query, self._q_scale)
 
         if output_shape is None:
@@ -557,6 +572,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 output,
                 self.layer_name,
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
+                query_for_cache=query_for_cache,
             )
         else:
             # Skip this if sharing KV cache with an earlier attention layer.
@@ -577,6 +593,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 output,
                 encoded,
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
+                query_for_cache=query_for_cache,
             )
         return output.view(-1, hidden_size)
 
@@ -681,7 +698,7 @@ class Attention(nn.Module, AttentionLayerBase):
 
 def get_attention_context(
     layer_name: str,
-) -> tuple[Any, "Attention | MLAAttention", torch.Tensor, torch.Tensor]:
+) -> tuple[Any, "Attention | MLAAttention", torch.Tensor, torch.Tensor | None]:
     """Extract attention context for a given layer.
 
     This helper function extracts the attention metadata, attention layer
@@ -775,13 +792,22 @@ def unified_attention_with_output(
     output_scale: torch.Tensor | None = None,
     output_block_scale: torch.Tensor | None = None,
     kv_cache_dummy_dep: torch.Tensor | None = None,
+    query_for_cache: torch.Tensor | None = None,
 ) -> None:
     # kv_cache_dummy_dep is not used but accepting it creates a data dependency
     # that ensures torch.compile preserves ordering between KV cache update and
     # attention forward.
     del kv_cache_dummy_dep
     layer_name = _resolve_layer_name(layer_name)
-    attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
+    attn_metadata, self, kv_cache, slots = get_attention_context(layer_name)
+    cache = getattr(self, "query_cache", None)
+    if cache is not None and self.attn_backend.forward_includes_kv_cache_update:
+        slots = getattr(attn_metadata, "slot_mapping", slots)
+    if cache is not None and slots is not None:
+        indices = getattr(attn_metadata, "logits_indices_padded", None)
+        if self.kv_sharing_target_layer_name is not None and indices is not None:
+            slots = slots[indices[: attn_metadata.num_logits_indices]]
+        cache.record(query if query_for_cache is None else query_for_cache, slots)
 
     self.impl.forward(
         self,

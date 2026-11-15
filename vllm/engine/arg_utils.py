@@ -78,6 +78,7 @@ from vllm.config.cache import (
     MambaCacheMode,
     MambaDType,
     PrefixCachingHashAlgo,
+    QueryCacheDType,
 )
 from vllm.config.device import Device
 from vllm.config.kernel import (
@@ -516,6 +517,7 @@ class EngineArgs:
     config_format: str = ModelConfig.config_format
     dtype: ModelDType = ModelConfig.dtype
     kv_cache_dtype: CacheDType | str = CacheConfig.cache_dtype
+    q_cache_dtype: QueryCacheDType = CacheConfig.q_cache_dtype
     seed: int = ModelConfig.seed
     max_model_len: int = ModelConfig.max_model_len
     cudagraph_capture_sizes: list[int] | None = (
@@ -1395,6 +1397,7 @@ class EngineArgs:
             "--kv-cache-memory-bytes", **cache_kwargs["kv_cache_memory_bytes"]
         )
         cache_group.add_argument("--kv-cache-dtype", **cache_kwargs["cache_dtype"])
+        cache_group.add_argument("--q-cache-dtype", **cache_kwargs["q_cache_dtype"])
         cache_group.add_argument(
             "--num-gpu-blocks-override", **cache_kwargs["num_gpu_blocks_override"]
         )
@@ -2309,6 +2312,7 @@ class EngineArgs:
             gpu_memory_utilization=self.gpu_memory_utilization,
             kv_cache_memory_bytes=self.kv_cache_memory_bytes,
             cache_dtype=resolved_cache_dtype,  # type: ignore[arg-type]
+            q_cache_dtype=self.q_cache_dtype,
             is_attention_free=model_config.is_attention_free,
             num_gpu_blocks_override=self.num_gpu_blocks_override,
             sliding_window=sliding_window,

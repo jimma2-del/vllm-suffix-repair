@@ -1,5 +1,43 @@
 # Quantized KV Cache
 
+## Storing decoder queries
+
+Decoder self-attention caches the query that enters attention for each
+computed token, after any normalization and rotary position embedding. This
+includes every local query head in grouped-query and multi-query attention.
+Existing attention kernels read only K and V.
+
+Set `q_cache_dtype` in Python or `--q-cache-dtype` on the command line.
+It defaults to `fp16` and is independent of `kv_cache_dtype`.
+
+```python
+from vllm import LLM
+
+llm = LLM(model="Qwen/Qwen2.5-1.5B-Instruct", q_cache_dtype="int4")
+```
+
+| Query format | Storage per query head of dimension D |
+| --- | --- |
+| `fp16`, `bf16` | 2 × D bytes |
+| `fp32` | 4 × D bytes |
+| `fp8` (E4M3FN), `int8` | D bytes + 4 bytes for the scale |
+| `int4` (signed, packed) | ceil(D / 2) bytes + 4 bytes for the scale |
+| `none` | 0 bytes, the original K/V-only allocation |
+
+Each quantized head has its own FP32 scale per token. Cache capacity includes
+the Q payload, rounded up to a whole physical KV head slot per token. For
+Qwen2.5-1.5B on one GPU with FP16 K/V, each layer uses 1,024 bytes per token
+for K/V. FP16 Q adds 3,072 bytes per token and packed INT4 Q adds 1,024.
+
+The block allocator shares, copies, offloads, evicts, and recycles Q with its
+K/V block. A suffix edit moves cached queries to the new rotary positions
+when reusing tokens, and writes fresh queries when recomputing tokens.
+External cache transports must preserve the complete page losslessly and use
+the same Q format. Raw-page transfers between tensor-parallel workers require
+matching TP sizes. NIXL also requires matching decode context parallel sizes.
+Cross-attention's encoder K/V and compressed latent attention caches have no
+corresponding per-token Q record.
+
 ## FP8 KV Cache Overview
 
 Efficient memory usage is crucial for working with large language models. Quantizing the KV (Key-Value) cache to FP8 format can significantly reduce its memory footprint. This optimization enables you to store more tokens in memory, leading to improved throughput and support for longer context windows.

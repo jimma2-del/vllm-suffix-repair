@@ -18,6 +18,7 @@ from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.hashing import safe_hash
 from vllm.v1.attention.backend import AttentionMetadata
+from vllm.v1.attention.ops.query_cache import get_cache_pages
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
@@ -104,6 +105,15 @@ class ExampleConnector(KVConnectorBase_V1):
         self._storage_path = self._kv_transfer_config.get_from_extra_config(
             "shared_storage_path", "/tmp"
         )
+        self._rank_suffix = ""
+        if kv_cache_config.has_query_cache:
+            pc = vllm_config.parallel_config
+            self._storage_path = os.path.join(
+                self._storage_path,
+                f"q-{vllm_config.cache_config.q_cache_dtype}"
+                f"-tp{pc.tensor_parallel_size}-dcp{pc.decode_context_parallel_size}",
+            )
+            self._rank_suffix = f".rank{pc.rank}"
         logger.info(self._kv_transfer_config)
         logger.info("Shared storage path is %s", self._storage_path)
 
@@ -151,8 +161,9 @@ class ExampleConnector(KVConnectorBase_V1):
                 )
                 dst_kv_cache_layer[slot_mapping, ...] = src_kv_cache
             else:
-                block_idxs = slot_mapping // self._block_size
-                offsets = slot_mapping % self._block_size
+                block_size = dst_kv_cache_layer.shape[2]
+                block_idxs = slot_mapping // block_size
+                offsets = slot_mapping % block_size
                 dst_kv_cache_layer[block_idxs, :, offsets] = src_kv_cache
 
         # Get the metadata
@@ -178,9 +189,9 @@ class ExampleConnector(KVConnectorBase_V1):
                 # Only process layers that have kv_cache
                 # attribute (attention layers) Skip non-attention
                 # layers like FusedMoEFactory/MLP etc.
-                kv_cache_layer = getattr(layer, "kv_cache", None)
-                if kv_cache_layer is None:
+                if getattr(layer, "kv_cache", None) is None:
                     continue
+                kv_cache_layer = get_cache_pages(layer)
 
                 filename = self._generate_filename_debug(
                     layer_name, request.token_ids, request.mm_hashes
@@ -242,8 +253,9 @@ class ExampleConnector(KVConnectorBase_V1):
             if isinstance(attn_metadata, MLACommonMetadata):
                 # [B, 1, N, C] -> [B * N, C]; slot_mapping indexes B * N slots.
                 return layer.reshape(-1, layer.shape[-1])[slot_mapping, ...]
-            block_idxs = slot_mapping // self._block_size
-            offsets = slot_mapping % self._block_size
+            block_size = layer.shape[2]
+            block_idxs = slot_mapping // block_size
+            offsets = slot_mapping % block_size
             return layer[block_idxs, :, offsets]
 
         connector_metadata = self._get_connector_metadata()
@@ -449,7 +461,7 @@ class ExampleConnector(KVConnectorBase_V1):
         foldername = self._generate_foldername_debug(
             token_ids, mm_hashes=mm_hashes, create_folder=True
         )
-        return os.path.join(foldername, f"{layer_name}.safetensors")
+        return os.path.join(foldername, f"{layer_name}{self._rank_suffix}.safetensors")
 
 
 def align_to_block_size(num_tokens: int, block_size) -> int:

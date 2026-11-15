@@ -77,6 +77,7 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_kv_cache_block_sizes,
 )
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
@@ -1515,6 +1516,8 @@ class MooncakeStoreWorker:
         self.store_tp_size, store_namespace, store_layout_cls = (
             self._select_store_layout(extra_config)
         )
+        if kv_cache_config.has_query_cache:
+            store_namespace += f"@q:{self.cache_config.q_cache_dtype}@tp:{self.tp_size}"
         metadata = KeyMetadata(
             model_name=model_config.model.rstrip("/").split("/")[-1],
             tp_rank=self.tp_rank,
@@ -1550,6 +1553,7 @@ class MooncakeStoreWorker:
         # Subclasses may use different sharding or cache-lifetime semantics.
         return (
             type(self._kv_cache_groups[0].kv_cache_spec) is FullAttentionSpec
+            and not self._kv_cache_groups[0].kv_cache_spec.query_bytes_per_token
             and str(extra_config.get("enable_cross_layers_blocks", "False")).lower()
             != "true"
         )
@@ -1681,7 +1685,11 @@ class MooncakeStoreWorker:
             else (spec,)
         )
         # Any rank-specific state makes the whole packed value rank-specific.
-        if any(isinstance(inner, MambaSpec) for inner in inner_specs):
+        if any(
+            isinstance(inner, MambaSpec)
+            or (isinstance(inner, AttentionSpec) and inner.query_bytes_per_token)
+            for inner in inner_specs
+        ):
             return 1
         # A pure MLA packed value is replicated on every TP rank.
         if all(

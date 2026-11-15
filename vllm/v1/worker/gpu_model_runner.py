@@ -141,6 +141,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
+from vllm.v1.attention.ops.query_cache import get_query_cache_sizes
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -228,6 +229,7 @@ from .utils import (
     add_kv_sharing_layers_to_kv_cache_groups,
     allocate_kv_cache,
     bind_kv_cache,
+    clear_layer_kv_caches,
     copy_kv_cache_blocks_inplace,
     customize_attention_spec,
     map_kv_caches_to_kernel_blocks,
@@ -6209,19 +6211,7 @@ class GPUModelRunner(
         # "runtime" pool; the real initialize_kv_cache rebuilds it.
         self._init_block_sizes = []
 
-        for layer in self.compilation_config.static_forward_context.values():
-            if hasattr(layer, "kv_cache"):
-                kv_cache = layer.kv_cache
-                layer.kv_cache = (
-                    torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
-                )
-            # Clean up quantized KV cache scale views
-            # (int8_per_token_head, fp8_per_token_head)
-            if hasattr(layer, "impl"):
-                if hasattr(layer.impl, "_k_scale_cache"):
-                    layer.impl._k_scale_cache = None
-                if hasattr(layer.impl, "_v_scale_cache"):
-                    layer.impl._v_scale_cache = None
+        clear_layer_kv_caches(self.compilation_config.static_forward_context.values())
 
         gc.collect()
         torch.accelerator.empty_cache()
@@ -7092,6 +7082,7 @@ class GPUModelRunner(
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         layer_type = cast(type[Any], AttentionLayerBase)
         attn_layers = get_layers_from_vllm_config(self.vllm_config, layer_type)
+        query_sizes = get_query_cache_sizes(attn_layers)
         for layer_name, attn_module in attn_layers.items():
             if isinstance(attn_module, Attention) and (
                 kv_tgt_layer := attn_module.kv_sharing_target_layer_name
@@ -7109,7 +7100,9 @@ class GPUModelRunner(
             if spec := attn_module.get_kv_cache_spec(self.vllm_config):
                 if isinstance(spec, AttentionSpec):
                     spec = customize_attention_spec(
-                        attn_module.get_attn_backend(), spec
+                        attn_module.get_attn_backend(),
+                        spec,
+                        query_sizes.get(layer_name, 0),
                     )
                 if attn_module.is_draft_layer:
                     spec = replace(spec, is_draft=True)

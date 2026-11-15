@@ -13,7 +13,12 @@ from vllm.config import (
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.tracing import instrument
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
+from vllm.v1.attention.ops.query_cache import get_cache_pages
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    group_kernel_blocks,
+    is_full_attention_spec,
+)
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -117,18 +122,19 @@ class CPUModelRunner(GPUModelRunner):
         # spec filter below already excludes them; no runner-only skip needed.
         seen_ptrs: set[int] = set()
         for group in self.kv_cache_config.kv_cache_groups:
-            if not isinstance(group.kv_cache_spec, FullAttentionSpec):
+            if not is_full_attention_spec(group.kv_cache_spec):
                 continue
             for layer_name in group.layer_names:
                 ctx = self.compilation_config.static_forward_context.get(layer_name)
                 if ctx is None:
                     continue
-                kv = ctx.kv_cache
+                kv = get_cache_pages(ctx)
                 if not isinstance(kv, torch.Tensor):
                     continue
                 if kv.data_ptr() in seen_ptrs:
                     continue
                 seen_ptrs.add(kv.data_ptr())
+                kv = group_kernel_blocks(kv, self.kv_cache_config.num_blocks)
                 for block_id in block_ids:
                     kv[block_id].zero_()
 

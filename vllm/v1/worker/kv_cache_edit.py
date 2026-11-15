@@ -10,6 +10,7 @@ from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.ops.query_cache import QueryCache
 from vllm.v1.core.kv_cache_edit import KVCacheEdit
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
@@ -106,6 +107,7 @@ def _copy_tokens(
     src_start: int,
     dst_start: int,
     count: int,
+    query_cache: QueryCache | None = None,
 ) -> None:
     # Bound the temporary gather independently of the context length.
     for offset in range(0, count, 1024):
@@ -118,6 +120,16 @@ def _copy_tokens(
         if src_start != dst_start:
             _relocate_keys(kv[..., : rope.head_size], rope, old, new)
         cache[dst // kernel_size, dst % kernel_size] = kv
+        if query_cache is not None and query_cache.data is not None:
+            if src_start == dst_start:
+                data = query_cache.data
+                data[dst // kernel_size, :, dst % kernel_size] = data[
+                    src // kernel_size, :, src % kernel_size
+                ]
+            else:
+                query = query_cache.read(src)
+                _relocate_keys(query, rope, old, new)
+                query_cache.write(query, dst)
 
 
 @torch.inference_mode()
@@ -149,7 +161,9 @@ def write_kv_cache_edit(
                 raise ValueError(
                     f"{name} needs a dense K/V cache and 1D RoPE for editing."
                 )
-            layers.append((cache.transpose(1, 2), rope))
+            layers.append(
+                (cache.transpose(1, 2), rope, getattr(layer, "query_cache", None))
+            )
 
     source, destination = (
         torch.tensor(pages, dtype=torch.long, device=runner.device)
@@ -158,7 +172,7 @@ def write_kv_cache_edit(
     # Whole prefix pages are shared. Seed the prefix in the first private page
     # for every layer before the replacement reads it.
     page_start = edit.start // edit.block_size * edit.block_size
-    for cache, rope in layers:
+    for cache, rope, query_cache in layers:
         _copy_tokens(
             cache,
             rope,
@@ -168,6 +182,7 @@ def write_kv_cache_edit(
             page_start,
             page_start,
             edit.start - page_start,
+            query_cache,
         )
 
     _prefill(runner, edit.replacement_ids, edit.start, destination, edit.block_size)
@@ -175,7 +190,7 @@ def write_kv_cache_edit(
     if edit.suffix_ids is not None:
         _prefill(runner, edit.suffix_ids, suffix_start, destination, edit.block_size)
     else:
-        for cache, rope in layers:
+        for cache, rope, query_cache in layers:
             _copy_tokens(
                 cache,
                 rope,
@@ -185,4 +200,5 @@ def write_kv_cache_edit(
                 edit.end,
                 suffix_start,
                 edit.copy_end - suffix_start,
+                query_cache,
             )

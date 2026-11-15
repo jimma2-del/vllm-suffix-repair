@@ -63,6 +63,8 @@ CacheDType = Literal[
     "nvfp4_4over6",
 ]
 
+QueryCacheDType = Literal["fp16", "bf16", "fp32", "fp8", "int8", "int4", "none"]
+
 # Mutable mirror of the CacheDType Literal. Custom dtypes registered by
 # platform backends are appended here at registration time. Never snapshot
 # this list (no list(...), tuple(...), or import-time key capture) —
@@ -242,6 +244,10 @@ class CacheConfig:
     "nvfp4_4over6" uses the NVFP4 layout and selects between max/6 and max/4
     scales per 16 values by minimizing squared reconstruction error.
     """
+    q_cache_dtype: QueryCacheDType = "fp16"
+    """Storage format for decoder self-attention queries. FP8 (E4M3), INT8
+    and packed INT4 use a separate FP32 scale per token and query head.
+    Set to 'none' to use the original KV-only allocation."""
     is_attention_free: bool = False
     """Whether the model is attention-free. This is primarily set in
     `ModelConfig` and that value should be manually duplicated here."""

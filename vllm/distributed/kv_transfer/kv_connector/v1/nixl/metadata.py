@@ -202,6 +202,10 @@ def compute_nixl_compatibility_hash(
         "transfer_mode": transfer_mode,
     }
 
+    if cache_config.q_cache_dtype != "none" and (
+        not model_config.use_mla or vllm_config.speculative_config is not None
+    ):
+        factors["q_cache_dtype"] = cache_config.q_cache_dtype
     compat_hash = hash_factors(factors)
     logger.debug(
         "NIXL compatibility hash: %s (model=%s, dtype=%s, num_kv_heads=%d, "

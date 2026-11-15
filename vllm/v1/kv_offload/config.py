@@ -24,6 +24,7 @@ class OffloadingModelConfig:
     name: str
     # KV cache data type (e.g. "float16").
     dtype: str
+    q_cache_dtype: str = "none"
 
 
 @dataclass(frozen=True)

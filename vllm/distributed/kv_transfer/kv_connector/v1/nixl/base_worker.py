@@ -2721,6 +2721,12 @@ class NixlBaseConnectorWorker:
         block_size_ratio = self.transfer_topo.block_size_ratio(
             nixl_agent_meta.block_size
         )
+        if (
+            tp_ratio != 1 or self.dcp_size != remote_dcp_size
+        ) and self.kv_cache_config.has_query_cache:
+            raise RuntimeError(
+                "NIXL transfers of cached queries require matching TP and DCP sizes."
+            )
         # num_kv_heads > tp_size with P_TP > D_TP not supported for non-mamba.
         # Mamba models can have replicated FA KV with tp_ratio < 0.
         # MLA models do not need to handle kv replication.

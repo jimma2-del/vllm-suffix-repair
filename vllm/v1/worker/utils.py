@@ -27,6 +27,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+from vllm.v1.attention.ops.query_cache import get_cache_pages
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -163,7 +164,7 @@ class KVBlockZeroer:
             for layer_name in group.layer_names:
                 if layer_name in runner_only_attn_layers:
                     continue
-                kv = static_forward_context[layer_name].kv_cache
+                kv = get_cache_pages(static_forward_context[layer_name])
                 if not isinstance(kv, torch.Tensor):
                     continue
                 if group.kernel_block_stride:
@@ -474,11 +475,23 @@ def map_kv_caches_to_kernel_blocks(
 
 
 def customize_attention_spec(
-    backend: type[AttentionBackend], spec: AttentionSpec
+    backend: type[AttentionBackend], spec: AttentionSpec, query_bytes_per_token: int = 0
 ) -> AttentionSpec:
     """The backend's spec. Blocks larger than every kernel block size a backend
     takes are split into kernel blocks, which packed blocks must keep whole."""
     spec = backend.customize_spec(spec)
+    if query_bytes_per_token:
+        # Replicated KV heads can still have distinct queries on each TP rank.
+        spec = replace(
+            spec, query_bytes_per_token=query_bytes_per_token, max_tp_shards=None
+        )
+        if spec.page_size_padded is not None:
+            spec = replace(
+                spec,
+                page_size_padded=max(
+                    spec.page_size_padded, spec.unpadded_page_size_bytes
+                ),
+            )
     sizes = backend.get_supported_kernel_block_sizes(spec)
     fixed_sizes = [s for s in sizes if isinstance(s, int)]
     if spec.block_stride_alignment is None and sizes and fixed_sizes == sizes:
@@ -876,8 +889,28 @@ def bind_kv_cache_to_layers(
     # its raw allocation into the per-layer view(s) it needs (e.g. Mamba
     # splits conv/ssm), so the kv_caches dict can hold a single tensor per
     # layer for the KV connector to register.
+    specs = {
+        name: group.kv_cache_spec
+        for group in kv_cache_groups or ()
+        for name in group.layer_names
+    }
     for layer_name, kv_cache in kv_caches.items():
-        forward_context[layer_name].bind_kv_cache(kv_cache)
+        layer = forward_context[layer_name]
+        if (cache := getattr(layer, "query_cache", None)) is not None:
+            spec = specs.get(layer_name)
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = spec.kv_cache_specs[
+                    layer.kv_sharing_target_layer_name or layer_name
+                ]
+            if isinstance(spec, AttentionSpec) and spec.query_bytes_per_token:
+                kv_cache = cache.bind(
+                    kv_cache,
+                    spec.num_head_slots or spec.num_kv_heads,
+                    packed_nvfp4=spec.kv_quant_mode.is_nvfp4,
+                )
+            else:
+                cache.unbind()
+        layer.bind_kv_cache(kv_cache)
 
     ordered_layer_names = sorted(
         kv_caches, key=lambda name: extract_layer_index(name, num_attn_module)
@@ -897,6 +930,8 @@ def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
             continue
         kv_cache = layer.kv_cache
         layer.kv_cache = torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
+        if (cache := getattr(layer, "query_cache", None)) is not None:
+            cache.unbind()
         # Clean up quantized KV cache scale views
         # (int8_per_token_head, fp8_per_token_head)
         if hasattr(layer, "impl"):

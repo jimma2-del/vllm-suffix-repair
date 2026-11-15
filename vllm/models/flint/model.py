@@ -359,6 +359,8 @@ class FlintAttention(nn.Module):
         num_tokens = qkv.shape[0]
         attn_output = torch.empty_like(q)
         if plan is not None:
+            if self.attn.query_cache is not None and layer_slots is not None:
+                self.attn.query_cache.record(q, layer_slots)
             self._run_decode_attention(q, attn_output, *plan)
         else:
             _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -467,6 +469,8 @@ class FlintAttention(nn.Module):
             self.num_kv_heads,
         )
         attn_output = torch.empty_like(q)
+        if self.attn.query_cache is not None:
+            self.attn.query_cache.record(q, layer_slots)
         self._run_decode_attention(q, attn_output, *plan)
         output, _ = self.o_proj(attn_output)
         return output, residual

@@ -181,6 +181,7 @@ def build_offloading_config(
         and single_group_spec is not None
         and isinstance(single_group_spec, FullAttentionSpec)
         and not isinstance(single_group_spec, MLAAttentionSpec)
+        and not single_group_spec.query_bytes_per_token
         and single_group_spec.num_kv_heads * parallel_config.tensor_parallel_size
         == vllm_config.model_config.get_total_num_kv_heads()
         and not single_group_spec.kv_quant_mode.is_per_token_head
@@ -198,7 +199,7 @@ def build_offloading_config(
             """Conservative static mirror of _layer_mapping's per-layer checks."""
             if not isinstance(spec, AttentionSpec):
                 return False
-            if spec.kv_quant_mode.is_per_token_head:
+            if spec.kv_quant_mode.is_per_token_head or spec.query_bytes_per_token:
                 return False
             if type(spec) is MLAAttentionSpec:
                 return (
@@ -261,6 +262,11 @@ def build_offloading_config(
         model=OffloadingModelConfig(
             name=vllm_config.model_config.model,
             dtype=str(cache_dtype).removeprefix("torch."),
+            q_cache_dtype=(
+                vllm_config.cache_config.q_cache_dtype
+                if kv_cache_config.has_query_cache
+                else "none"
+            ),
         ),
         cache=OffloadingCacheConfig(
             tokens_per_hash=tokens_per_hash,

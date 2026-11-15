@@ -23,6 +23,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import create_fast_prefill_custom_backend
+from vllm.v1.attention.ops.query_cache import get_query_cache_sizes
 from vllm.v1.hisparse.binding import (
     init_hisparse_kv_cache,
     resolve_hisparse_specs,
@@ -139,6 +140,7 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     kv_cache_spec: dict[str, KVCacheSpec] = {}
     layer_type = cast(type[Any], AttentionLayerBase)
     attn_layers = get_layers_from_vllm_config(vllm_config, layer_type)
+    query_sizes = get_query_cache_sizes(attn_layers)
     for layer_name, attn_module in attn_layers.items():
         if getattr(attn_module, "kv_sharing_target_layer_name", None):
             # This layer will use KV cache of the sharing target layer.
@@ -146,7 +148,11 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
         # Skip modules that don't need KV cache (eg encoder-only attention)
         if spec := attn_module.get_kv_cache_spec(vllm_config):
             if isinstance(spec, AttentionSpec):
-                spec = customize_attention_spec(attn_module.get_attn_backend(), spec)
+                spec = customize_attention_spec(
+                    attn_module.get_attn_backend(),
+                    spec,
+                    query_sizes.get(layer_name, 0),
+                )
             if attn_module.is_draft_layer:
                 spec = replace(spec, is_draft=True)
             kv_cache_spec[layer_name] = spec

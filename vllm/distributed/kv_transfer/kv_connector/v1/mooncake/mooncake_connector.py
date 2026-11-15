@@ -633,6 +633,7 @@ class MooncakeXferMetadata(
     # peer did not send the field, so the run must not be promoted.
     registered_row_offsets: list[int] = msgspec.field(default_factory=list)
     remote_pp_size: int = 1
+    q_cache_dtype: str = "none"
     # Random per register_kv_caches, so ids never repeat across restarts.
     # 0 means the peer sends the layout on every pull.
     layout_id: int = 0
@@ -1225,6 +1226,8 @@ class MooncakeConnectorScheduler:
 class MooncakeConnectorWorker:
     """Implementation of Worker side methods."""
 
+    q_cache_dtype: str = "none"
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -1375,6 +1378,8 @@ class MooncakeConnectorWorker:
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.kv_cache_config = kv_cache_config
+        if kv_cache_config.has_query_cache:
+            self.q_cache_dtype = self.cache_config.q_cache_dtype
         self.use_mla = self.model_config.use_mla
         self._physical_blocks_per_logical_kv_block = 1
         self._sync_block_size_with_kernel()
@@ -1565,6 +1570,15 @@ class MooncakeConnectorWorker:
         self, identity: bytes, sock: zmq.asyncio.Socket, meta: MooncakeXferMetadata
     ):
         pending_reqs: dict[ReqId, SendBlockMeta] = {}
+        if self.q_cache_dtype != meta.q_cache_dtype or (
+            self.q_cache_dtype != "none" and self.tp_size != meta.remote_tp_size
+        ):
+            response = MooncakeXferResponse(
+                status=MooncakeXferResponseStatus.ERROR,
+                err_msg="Cached queries require matching Q formats and TP sizes.",
+            )
+            await sock.send_multipart((identity, self._encoder.encode(response)))
+            return
         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(meta.remote_tp_size)
         if meta.remote_tp_rank not in remote_tp_ranks:
             # This D worker does not pair with the P worker.
@@ -2902,6 +2916,7 @@ class MooncakeConnectorWorker:
         if not include_layout:
             return MooncakeXferMetadata(
                 remote_hostname=self.hostname,
+                q_cache_dtype=self.q_cache_dtype,
                 remote_port=self.rpc_port,
                 remote_tp_size=self.tp_size,
                 remote_tp_rank=self.tp_rank,
@@ -2914,6 +2929,7 @@ class MooncakeConnectorWorker:
             )
         return MooncakeXferMetadata(
             remote_hostname=self.hostname,
+            q_cache_dtype=self.q_cache_dtype,
             remote_port=self.rpc_port,
             remote_tp_size=self.tp_size,
             remote_tp_rank=self.tp_rank,
