@@ -49,6 +49,7 @@ from vllm.v1.engine import (
     PauseMode,
     ReconfigureDistributedRequest,
     ReconfigureRankType,
+    SuffixSelection,
     UtilityOutput,
 )
 from vllm.v1.engine.coordinator import DPCoordinator
@@ -212,7 +213,7 @@ class EngineCoreClient(ABC):
         start: int,
         end: int,
         cache_salt: str | None,
-        recompute_suffix: bool = False,
+        recompute_suffix: bool | SuffixSelection = False,
     ) -> str:
         raise NotImplementedError
 
@@ -462,7 +463,7 @@ class InprocClient(EngineCoreClient):
         start: int,
         end: int,
         cache_salt: str | None,
-        recompute_suffix: bool = False,
+        recompute_suffix: bool | SuffixSelection = False,
     ) -> str:
         return self.engine_core.edit_kv_cache(
             original_ids, replacement_ids, start, end, cache_salt, recompute_suffix
@@ -1129,7 +1130,7 @@ class SyncMPClient(MPClient):
         start: int,
         end: int,
         cache_salt: str | None,
-        recompute_suffix: bool = False,
+        recompute_suffix: bool | SuffixSelection = False,
     ) -> str:
         return self.call_utility(
             "edit_kv_cache",

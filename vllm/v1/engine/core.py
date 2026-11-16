@@ -78,6 +78,7 @@ from vllm.v1.engine import (
     PauseMode,
     ReconfigureDistributedRequest,
     ReconfigureRankType,
+    SuffixSelection,
     UtilityOutput,
     UtilityResult,
 )
@@ -914,7 +915,7 @@ class EngineCore:
         start: int,
         end: int,
         cache_salt: str | None,
-        recompute_suffix: bool = False,
+        recompute_suffix: bool | SuffixSelection = False,
     ) -> str:
         manager = getattr(self.scheduler, "kv_cache_manager", None)
         editor = getattr(manager, "editor", None)
@@ -923,6 +924,11 @@ class EngineCore:
                 "KV editing requires local prefix caching with one unquantized, "
                 "dense causal attention group and no speculative decoding or LoRA."
             )
+        if (
+            isinstance(recompute_suffix, dict)
+            and self.vllm_config.cache_config.q_cache_dtype == "none"
+        ):
+            raise ValueError("Selective recomputation requires a stored query cache.")
         length = len(original_ids) - (end - start) + len(replacement_ids)
         config = self.vllm_config.model_config
         if max(length, len(original_ids)) > config.max_model_len:

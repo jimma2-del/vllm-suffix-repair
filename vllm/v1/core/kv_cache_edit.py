@@ -16,6 +16,7 @@ from vllm.v1.core.kv_cache_utils import (
     get_request_block_hasher,
     hash_block_tokens,
 )
+from vllm.v1.engine import SuffixSelection
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVQuantMode
 from vllm.v1.request import Request
 
@@ -32,6 +33,7 @@ class KVCacheEdit:
     suffix_ids: list[int] | None  # None reuses the source suffix KV.
     start: int
     end: int
+    selection: SuffixSelection | None = None
 
 
 class KVCacheEditor:
@@ -138,7 +140,7 @@ class KVCacheEditor:
         cache_salt: str | None,
         write: Callable[[KVCacheEdit], object],
         *,
-        recompute_suffix: bool = False,
+        recompute_suffix: bool | SuffixSelection = False,
     ) -> str:
         if not 0 <= start <= end <= len(original_ids):
             raise ValueError("Expected 0 <= start <= end <= len(original_token_ids).")
@@ -158,11 +160,20 @@ class KVCacheEditor:
                 )
             source.append(blocks[0])
 
+        selection = recompute_suffix if isinstance(recompute_suffix, dict) else None
+        if (
+            selection is not None
+            and not replacement_ids
+            and (start == end or not selection["include_deleted"])
+        ):
+            # With no keys to score the ordinary suffix reuse path is sufficient.
+            selection = None
+        replay_suffix = recompute_suffix is True or selection is not None
         num_pages = cdiv(edited.num_tokens, size)
         # A reused, unshifted suffix can share whole source pages.
         changed_end = (
             edited.num_tokens
-            if recompute_suffix or edited.num_tokens != len(original_ids)
+            if replay_suffix or edited.num_tokens != len(original_ids)
             else end
         )
         if changed_end == start:
@@ -182,9 +193,10 @@ class KVCacheEditor:
                         destination=[b.block_id for b in destination],
                         copy_end=min(last * size, edited.num_tokens),
                         replacement_ids=replacement_ids,
-                        suffix_ids=original_ids[end:] if recompute_suffix else None,
+                        suffix_ids=original_ids[end:] if replay_suffix else None,
                         start=start,
                         end=end,
+                        selection=selection,
                     )
                 )
             for i, block in enumerate(destination):

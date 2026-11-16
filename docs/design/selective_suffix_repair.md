@@ -1,10 +1,20 @@
 # Selective suffix repair for `LLM.edit_kv_cache`
 
-The current editor can reuse a suffix or recompute it in full. The proposed
-mode scores each suffix token in each attention layer, then recomputes all
-heads for selected tokens. The goal is to reduce edit latency while retaining
-the complete causal context. [Existing edit worker](../../vllm/v1/worker/kv_cache_edit.py)
-and [implementation plan](selective_suffix_repair_plan.md).
+Pass `recompute_suffix="selective"` and an explicit `threshold` to score each
+suffix token, then recompute all heads and layers for tokens strictly above
+that threshold. This requires a bound Q cache. The default reductions are
+`max`, and `include_deleted=True` scores removed keys as well as replacements.
+The boolean modes select suffix reuse (`False`) or full suffix replay (`True`).
+[Edit worker](../../vllm/v1/worker/kv_cache_edit.py) and
+[verification plan](selective_suffix_repair_plan.md#verification-plan).
+
+```python
+edited = llm.edit_kv_cache(
+    original_token_ids, replacement_text, start, end,
+    recompute_suffix="selective", threshold=score_threshold,
+    key_reduction="max", head_reduction="max", layer_reduction="max",
+)
+```
 
 ## Where scores are aggregated
 
@@ -30,7 +40,7 @@ its own KV group. Count each query head once. [Query cache formats](../features/
 
 Include keys from the removed span by default, with an option to disable them.
 A pure deletion can therefore select tokens using only the original cache. For
-length-changing edits, the proposed position convention scores removed keys
+length-changing edits, the selector scores removed keys
 against Q at its original position and new keys against Q at its edited RoPE
 position. Both use the same cached query content.
 

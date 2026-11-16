@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, overload
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 import cloudpickle
 import torch.nn as nn
@@ -49,7 +50,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.counter import Counter
-from vllm.v1.engine import PauseMode
+from vllm.v1.engine import PauseMode, ScoreReduction, SuffixSelection
 from vllm.v1.engine.llm_engine import LLMEngine
 from vllm.v1.sample.logits_processor import LogitsProcessor
 
@@ -844,7 +845,12 @@ class LLM(
         end: int,
         *,
         cache_salt: str | None = None,
-        recompute_suffix: bool = False,
+        recompute_suffix: bool | Literal["selective"] = False,
+        threshold: float | None = None,
+        key_reduction: ScoreReduction = "max",
+        head_reduction: ScoreReduction = "max",
+        layer_reduction: ScoreReduction = "max",
+        include_deleted: bool = True,
     ) -> TokensPrompt:
         """Replace a token range in a resident prompt's cached KV.
 
@@ -860,9 +866,15 @@ class LLM(
             start: First token to replace (inclusive).
             end: First suffix token to keep (exclusive).
             cache_salt: Salt of the original prompt, including for chained edits.
-            recompute_suffix: Run a separate causal prefill of the suffix against
-                the cached prefix and replacement. Defaults to False, which reuses
-                the suffix KV and corrects its keys if their positions shift.
+            recompute_suffix: False reuses the position-adjusted suffix. True
+                recomputes it in full. "selective" uses cached Q to choose
+                whole tokens to replay through all layers at model precision.
+            threshold: In selective mode, replay scores strictly above this value.
+            key_reduction: Reduce signed Q·K scores across affected keys.
+            head_reduction: Reduce the resulting scores across query heads.
+            layer_reduction: Reduce the head-reduced scores across layers.
+            include_deleted: Include the original keys of removed tokens in
+                selective scoring, including for a pure deletion.
 
         Returns:
             Edited token IDs and a fresh cache salt. Pass the returned prompt
@@ -877,13 +889,41 @@ class LLM(
             raise TypeError("new_tokens must be a string.")
         if not 0 <= start <= end <= len(original):
             raise ValueError("Expected 0 <= start <= end <= len(original_token_ids).")
+        policy: bool | SuffixSelection
+        reductions = (key_reduction, head_reduction, layer_reduction)
+        if recompute_suffix == "selective":
+            if threshold is None or math.isnan(threshold):
+                raise ValueError(
+                    "Selective recomputation requires a non-NaN threshold."
+                )
+            if any(op not in ("sum", "max") for op in reductions):
+                raise ValueError("Score reductions must be 'max' or 'sum'.")
+            if not isinstance(include_deleted, bool):
+                raise TypeError("include_deleted must be a boolean.")
+            policy = SuffixSelection(
+                threshold=float(threshold),
+                key_reduction=key_reduction,
+                head_reduction=head_reduction,
+                layer_reduction=layer_reduction,
+                include_deleted=include_deleted,
+            )
+        elif isinstance(recompute_suffix, bool):
+            if (
+                threshold is not None
+                or not include_deleted
+                or reductions != ("max",) * 3
+            ):
+                raise ValueError("Score options require recompute_suffix='selective'.")
+            policy = recompute_suffix
+        else:
+            raise ValueError("recompute_suffix must be False, True, or 'selective'.")
         replacement = (
             self.get_tokenizer().encode(new_tokens, add_special_tokens=False)
             if new_tokens
             else []
         )
         salt = self.llm_engine.engine_core.edit_kv_cache(
-            original, replacement, start, end, cache_salt, recompute_suffix
+            original, replacement, start, end, cache_salt, policy
         )
         return {
             "prompt_token_ids": original[:start] + replacement + original[end:],

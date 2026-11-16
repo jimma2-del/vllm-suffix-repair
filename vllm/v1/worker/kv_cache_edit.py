@@ -5,13 +5,16 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+import torch.distributed as dist
 
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.ops.query_cache import QueryCache
 from vllm.v1.core.kv_cache_edit import KVCacheEdit
+from vllm.v1.engine import ScoreReduction
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
     build_slot_mappings_by_layer,
@@ -66,8 +69,7 @@ def _prefill(
         count = chunk.numel()
         end = start_pos + count
         positions = torch.arange(start_pos, end, device=device)
-        slots = pages[positions // block_size].long() * block_size
-        slots += positions % block_size
+        slots = _slots(pages, positions, block_size)
         query_start = torch.tensor([0, count], dtype=torch.int32, device="cpu")
         seq_len = torch.tensor([end], dtype=torch.int32, device="cpu")
         slots = slots.unsqueeze(0)
@@ -98,6 +100,12 @@ def _prefill(
         start_pos = end
 
 
+def _slots(
+    pages: torch.Tensor, positions: torch.Tensor, block_size: int
+) -> torch.Tensor:
+    return pages[positions // block_size].long() * block_size + positions % block_size
+
+
 def _copy_tokens(
     cache: torch.Tensor,
     rope: RotaryEmbedding,
@@ -113,8 +121,8 @@ def _copy_tokens(
     for offset in range(0, count, 1024):
         steps = torch.arange(offset, min(offset + 1024, count), device=cache.device)
         old, new = steps + src_start, steps + dst_start
-        src = src_pages[old // block_size] * block_size + old % block_size
-        dst = dst_pages[new // block_size] * block_size + new % block_size
+        src = _slots(src_pages, old, block_size)
+        dst = _slots(dst_pages, new, block_size)
         kernel_size = cache.shape[1]
         kv = cache[src // kernel_size, src % kernel_size]
         if src_start != dst_start:
@@ -132,6 +140,104 @@ def _copy_tokens(
                 query_cache.write(query, dst)
 
 
+def _reduce(scores: torch.Tensor, dim: int, op: ScoreReduction) -> torch.Tensor:
+    return scores.amax(dim) if op == "max" else scores.sum(dim)
+
+
+def _accumulate(
+    result: torch.Tensor, partial: torch.Tensor, op: ScoreReduction
+) -> None:
+    if op == "max":
+        torch.maximum(result, partial, out=result)
+    else:
+        result.add_(partial)
+
+
+def _score_key_span(
+    cache: torch.Tensor,
+    query_cache: QueryCache,
+    key_slots: torch.Tensor,
+    query_slots: torch.Tensor,
+    head_scores: torch.Tensor,
+    reduction: ScoreReduction,
+) -> None:
+    """Fold one old or new key span into this layer's per-query-head scores."""
+    kernel_size, kv_heads = cache.shape[1:3]
+    # Quantize a key tile once for all suffix queries and all heads in its group.
+    for key_start in range(0, len(key_slots), 128):
+        slots = key_slots[key_start : key_start + 128]
+        keys = cache[
+            slots // kernel_size, slots % kernel_size, :, : query_cache.head_size
+        ]
+        keys = query_cache.roundtrip_keys(keys).float()
+        for start in range(0, len(query_slots), 256):
+            tile = slice(start, start + 256)
+            query = query_cache.read(query_slots[tile]).float()
+            query = query.unflatten(1, (kv_heads, -1))
+            # [suffix, KV head, query within group, affected key]
+            dots = torch.einsum("tkgd,skd->tkgs", query, keys)
+            partial = _reduce(dots, -1, reduction).flatten(1)
+            _accumulate(head_scores[tile], partial, reduction)
+
+
+def _selected_runs(
+    edit: KVCacheEdit,
+    layers: dict[str, tuple[torch.Tensor, RotaryEmbedding, QueryCache | None]],
+    source: torch.Tensor,
+    destination: torch.Tensor,
+) -> list[list[int]]:
+    """Return contiguous suffix-relative runs after all layers have scored."""
+    options = edit.selection
+    assert edit.suffix_ids is not None and options is not None
+    count = len(edit.suffix_ids)
+    removed = edit.end - edit.start if options["include_deleted"] else 0
+    inserted = len(edit.replacement_ids)
+    if not count or not (removed or inserted):
+        return []
+
+    device = destination.device
+    offsets = torch.arange(count, device=device)
+
+    def span_slots(pages: torch.Tensor, length: int) -> torch.Tensor:
+        return _slots(
+            pages, edit.start + torch.arange(length, device=device), edit.block_size
+        )
+
+    old_keys = span_slots(source, removed)
+    new_keys = span_slots(destination, inserted)
+    old_queries = _slots(source, edit.end + offsets, edit.block_size)
+    new_queries = _slots(destination, edit.start + inserted + offsets, edit.block_size)
+    key_op = options["key_reduction"]
+    head_op = options["head_reduction"]
+    layer_op = options["layer_reduction"]
+    scores = torch.full(
+        (count,),
+        -torch.inf if layer_op == "max" else 0.0,
+        dtype=torch.float32,
+        device=device,
+    )
+    tp = get_tp_group()
+    # Match per-layer collectives even when attention groups enumerate layers
+    # in a different order on different ranks.
+    for name in sorted(layers):
+        cache, _, query_cache = layers[name]
+        assert query_cache is not None
+        by_head = scores.new_full(
+            (count, query_cache.num_heads), -torch.inf if key_op == "max" else 0.0
+        )
+        _score_key_span(cache, query_cache, old_keys, old_queries, by_head, key_op)
+        _score_key_span(cache, query_cache, new_keys, new_queries, by_head, key_op)
+        by_layer = _reduce(by_head, 1, head_op)
+        if tp.world_size > 1:
+            op = dist.ReduceOp.MAX if head_op == "max" else dist.ReduceOp.SUM
+            dist.all_reduce(by_layer, op=op, group=tp.device_group)
+        _accumulate(scores, by_layer, layer_op)
+
+    mask = torch.nn.functional.pad(scores > options["threshold"], (1, 1))
+    boundaries = (mask[1:] != mask[:-1]).nonzero().reshape(-1, 2)
+    return boundaries.tolist()
+
+
 @torch.inference_mode()
 def write_kv_cache_edit(
     runner: GPUModelRunner | GPUModelRunnerV2,
@@ -139,7 +245,7 @@ def write_kv_cache_edit(
 ) -> None:
     model = runner.get_model()
     context = runner.vllm_config.compilation_config.static_forward_context
-    layers = []
+    layers = {}
     for group in runner.attn_groups[0]:
         for name in group.layer_names:
             parent = model.get_submodule(name.rsplit(".", 1)[0])
@@ -161,9 +267,17 @@ def write_kv_cache_edit(
                 raise ValueError(
                     f"{name} needs a dense K/V cache and 1D RoPE for editing."
                 )
-            layers.append(
-                (cache.transpose(1, 2), rope, getattr(layer, "query_cache", None))
-            )
+            query_cache = getattr(layer, "query_cache", None)
+            if edit.selection is not None and (
+                query_cache is None
+                or query_cache.data is None
+                or query_cache.head_size != rope.head_size
+                or query_cache.num_heads % layer.num_kv_heads
+            ):
+                raise ValueError(
+                    f"{name} requires a bound per-head Q cache for selection."
+                )
+            layers[name] = (cache.transpose(1, 2), rope, query_cache)
 
     source, destination = (
         torch.tensor(pages, dtype=torch.long, device=runner.device)
@@ -172,7 +286,7 @@ def write_kv_cache_edit(
     # Whole prefix pages are shared. Seed the prefix in the first private page
     # for every layer before the replacement reads it.
     page_start = edit.start // edit.block_size * edit.block_size
-    for cache, rope, query_cache in layers:
+    for cache, rope, query_cache in layers.values():
         _copy_tokens(
             cache,
             rope,
@@ -187,18 +301,28 @@ def write_kv_cache_edit(
 
     _prefill(runner, edit.replacement_ids, edit.start, destination, edit.block_size)
     suffix_start = edit.start + len(edit.replacement_ids)
-    if edit.suffix_ids is not None:
+    if edit.suffix_ids is not None and edit.selection is None:
         _prefill(runner, edit.suffix_ids, suffix_start, destination, edit.block_size)
-    else:
-        for cache, rope, query_cache in layers:
-            _copy_tokens(
-                cache,
-                rope,
-                edit.block_size,
-                source,
+        return
+    for cache, rope, query_cache in layers.values():
+        _copy_tokens(
+            cache,
+            rope,
+            edit.block_size,
+            source,
+            destination,
+            edit.end,
+            suffix_start,
+            edit.copy_end - suffix_start,
+            query_cache,
+        )
+    if edit.selection is not None:
+        assert edit.suffix_ids is not None
+        for start, end in _selected_runs(edit, layers, source, destination):
+            _prefill(
+                runner,
+                edit.suffix_ids[start:end],
+                suffix_start + start,
                 destination,
-                edit.end,
-                suffix_start,
-                edit.copy_end - suffix_start,
-                query_cache,
+                edit.block_size,
             )

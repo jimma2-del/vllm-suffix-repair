@@ -181,38 +181,61 @@ class QueryCache:
         query = query.view(-1, self.num_heads, self.head_size)[: slots.numel()]
         assert query.shape[0] == slots.numel()
         if data.is_cuda:
-            raw = self.dtype in _FLOAT_DTYPES
-            src = self._encode(query) if raw else query
-            _store_query[(len(slots), self.num_heads)](
-                src,
-                data,
-                slots,
-                *src.stride(),
-                *data.stride()[:3],
-                data.shape[2],
-                data.shape[3],
-                self.row_bytes,
-                self.head_size,
-                self.byte_offset,
-                "raw" if raw else self.dtype,
-                _QUANT_MAX.get(self.dtype, 0),
-                triton.next_power_of_2(
-                    self.row_bytes if raw else max(2, self.head_size)
-                ),
-            )
+            self._write_cuda(query, slots, data, self.byte_offset)
         else:
             valid = slots >= 0
             valid_slots = slots[valid]
             if valid_slots.numel():
                 data[self._indices(valid_slots)] = self._encode(query[valid]).flatten(1)
 
+    def _write_cuda(
+        self,
+        vectors: torch.Tensor,
+        slots: torch.Tensor,
+        data: torch.Tensor,
+        byte_offset: int,
+    ) -> None:
+        raw = self.dtype in _FLOAT_DTYPES
+        src = self._encode(vectors) if raw else vectors
+        _store_query[(len(slots), vectors.shape[1])](
+            src,
+            data,
+            slots,
+            *src.stride(),
+            *data.stride()[:3],
+            data.shape[2],
+            data.shape[3],
+            self.row_bytes,
+            self.head_size,
+            byte_offset,
+            "raw" if raw else self.dtype,
+            _QUANT_MAX.get(self.dtype, 0),
+            triton.next_power_of_2(self.row_bytes if raw else max(2, self.head_size)),
+        )
+
     def read(self, slots: torch.Tensor) -> torch.Tensor:
         """Decode the specified physical slots, e.g. to relocate post-RoPE Q."""
         assert self.data is not None
         rows = self.data[self._indices(slots)].view(-1, self.num_heads, self.row_bytes)
+        return self._decode(rows)
+
+    def roundtrip_keys(self, keys: torch.Tensor) -> torch.Tensor:
+        """Represent each KV head in the query format for edit scoring."""
+        if self.dtype in _FLOAT_DTYPES:
+            return keys.to(_FLOAT_DTYPES[self.dtype])
+        if keys.is_cuda and keys.numel():
+            # Use the Q writer's exact scale and tie rounding. Each temporary
+            # page contains one token and one byte plane per KV head.
+            tokens, heads, _ = keys.shape
+            rows = keys.new_empty((tokens, heads, 1, self.row_bytes), dtype=torch.uint8)
+            self._write_cuda(keys, torch.arange(tokens, device=keys.device), rows, 0)
+            return self._decode(rows.squeeze(2))
+        return self._decode(self._encode(keys))
+
+    def _decode(self, rows: torch.Tensor) -> torch.Tensor:
         if self.dtype in _FLOAT_DTYPES:
             return rows.view(_FLOAT_DTYPES[self.dtype])
-        scale = rows[..., :4].flatten().view(torch.float32).view(-1, self.num_heads, 1)
+        scale = rows[..., :4].flatten().view(torch.float32).view(*rows.shape[:-1], 1)
         payload = rows[..., 4:]
         if self.dtype == "fp8":
             q = payload.view(torch.float8_e4m3fn).float()

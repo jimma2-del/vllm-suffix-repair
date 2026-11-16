@@ -5,7 +5,7 @@ import enum
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
 import msgspec
 import numpy as np
@@ -31,6 +31,19 @@ from vllm.v1.serial_utils import UtilityResult
 # - "wait": Wait for in-flight requests to complete before pausing.
 # - "keep": Freeze requests in queue; they resume on resume_generation().
 PauseMode = Literal["abort", "wait", "keep"]
+
+ScoreReduction = Literal["max", "sum"]
+
+
+class SuffixSelection(TypedDict):
+    """Whole-token selection options carried by the edit RPC."""
+
+    threshold: float
+    key_reduction: ScoreReduction
+    head_reduction: ScoreReduction
+    layer_reduction: ScoreReduction
+    include_deleted: bool
+
 
 # These are possible values of RequestOutput.finish_reason,
 # so form part of the external API.

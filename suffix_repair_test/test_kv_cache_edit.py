@@ -104,18 +104,41 @@ class KVCacheEditTest(unittest.TestCase):
     def test_failure_releases_pages_and_preserves_source(self):
         count = self.pool.get_num_free_blocks()
         entries = len(self.pool.cached_block_hash_to_block)
-        with self.assertRaisesRegex(RuntimeError, "worker failed"):
-            self.editor.edit(
-                self.ids,
-                [7],
-                0,
-                2,
-                "source",
-                Mock(side_effect=RuntimeError("worker failed")),
-            )
-        self.assertEqual(entries, len(self.pool.cached_block_hash_to_block))
-        with self.assertRaisesRegex(ValueError, "free blocks"):
-            self.editor.edit(self.ids, [7] * 80, 0, 1, "source", Mock())
+        selective = dict(
+            threshold=0,
+            key_reduction="max",
+            head_reduction="max",
+            layer_reduction="max",
+            include_deleted=True,
+        )
+        for mode in (False, selective):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(RuntimeError, "worker failed"):
+                    self.editor.edit(
+                        self.ids,
+                        [7],
+                        0,
+                        2,
+                        "source",
+                        Mock(side_effect=RuntimeError("worker failed")),
+                        recompute_suffix=mode,
+                    )
+                self.assertEqual(entries, len(self.pool.cached_block_hash_to_block))
+                write = Mock()
+                with self.assertRaisesRegex(ValueError, "free blocks"):
+                    self.editor.edit(
+                        self.ids,
+                        [7] * 100,
+                        0,
+                        1,
+                        "source",
+                        write,
+                        recompute_suffix=mode,
+                    )
+                write.assert_not_called()
+                self.assertEqual(entries, len(self.pool.cached_block_hash_to_block))
+                self.assertEqual(count, self.pool.get_num_free_blocks())
+                self.assertTrue(all(b.ref_cnt == 1 for b in self.pages))
         with self.assertRaisesRegex(ValueError, "not cached"):
             self.editor.edit(self.ids, [], 0, 1, "wrong salt", Mock())
         self.assertEqual(count, self.pool.get_num_free_blocks())

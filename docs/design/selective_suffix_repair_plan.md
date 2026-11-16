@@ -51,16 +51,42 @@ neither hidden-state checkpoints nor a new attention kernel.
    stores Q in the configured format. An empty mask needs no replay and a
    full mask becomes one contiguous suffix prefill.
 
-## Verification when implementation begins
+## Verification plan
 
-Start with static checks of option propagation, page ownership, score shapes,
-head mapping and causal positions. For the later GPU checks, compare the
-all-selected and none-selected cases against the existing full-recompute and
-reuse modes. Check isolated selections across a page boundary against a
-token-at-a-time replay over the same mixture of reused and fresh K/V. Include
-length changes, pure deletion, mixed reductions, quantized Q, tensor-parallel
-rank agreement and source-cache integrity after a chained edit.
+The verification runs, latency measurements and reproduction commands are
+recorded in the [verification report](selective_suffix_repair_verification.md).
 
-Measure end-to-end edit latency alongside the selected fraction and number of
-contiguous runs. Fragmented selections can make forward-launch overhead
-significant even when few tokens are selected.
+1. **Static checks.** Lint, check formatting, and compile the changed Python
+   files. Trace the selective options through both synchronous clients and
+   check that page publication follows the worker RPC.
+2. **Independent score reference.** On a short resident prompt, snapshot
+   original Q/K and replacement K. Independently cast or quantize each K to
+   the Q format, apply the stored scales, and compute signed dot products in
+   FP32. Reduce explicitly over keys, query heads and layers in that order.
+   Compare the selected indices for all eight reduction combinations across
+   MHA, GQA and MQA. Include negative scores, exact threshold ties, zero
+   vectors, all supported Q formats, and spans crossing scoring tile sizes.
+3. **Replay and cache contents.** For finite scores and at least one included
+   key, use negative and positive infinity thresholds to compare with full
+   recomputation and reuse respectively. Pick an intermediate threshold that
+   selects separated runs, including a page boundary. Compare each layer's
+   Q/K/V with a token-at-a-time reference over the same edited causal prefix.
+   Use model-dtype tolerances for fresh vectors and compare raw Q bytes for
+   unshifted, skipped tokens. Resend and extend the returned salted prompt.
+4. **Positions and options.** Exercise insertion, equal-length replacement,
+   expansion, contraction and pure deletion. Score deleted keys with original
+   queries and replacement keys with relocated queries. Disabling deleted-key
+   scoring on a pure deletion must select nothing even at a negative threshold.
+   Cover empty suffixes, no-op edits, missing Q, a missing or NaN threshold,
+   invalid reductions and both legacy boolean modes.
+5. **Process and page ownership.** Repeat via in-process and multiprocess
+   clients, both GPU runners and tensor parallelism. Include a case where
+   only a non-driver rank has a high score and a case with replicated KV heads.
+   Compare rank masks to a reference over all distinct query heads. Snapshot
+   the original pages before a chained edit. Check source contents after
+   success and check reference counts and unpublished aliases on worker or
+   allocation failure.
+6. **Latency.** On the same warm source prompt, compare reuse, full replay
+   and selective replay for edits with clustered and fragmented selections.
+   Record model, device, Q format, reduction settings, prompt and edit lengths,
+   threshold, selected fraction, run count and end-to-end edit latency.
