@@ -8,6 +8,15 @@ The boolean modes select suffix reuse (`False`) or full suffix replay (`True`).
 [Edit worker](../../vllm/v1/worker/kv_cache_edit.py) and
 [verification plan](selective_suffix_repair_plan.md#verification-plan).
 
+This document records the selection design, implemented architecture and
+follow-up proposals discussed through November 21, 2026. The
+[KV editing record](kv_cache_editing.md) covers the underlying API, page
+ownership and publication protocol. The [query storage record](query_cache.md)
+covers page layout, encoding and lifecycle integration. The
+[implementation plan](selective_suffix_repair_plan.md) records the chosen
+work sequence, and the [verification report](selective_suffix_repair_verification.md)
+contains measured results and reproduction commands.
+
 ```python
 edited = llm.edit_kv_cache(
     original_token_ids, replacement_text, start, end,
@@ -153,3 +162,123 @@ IDs can be recycled, and chained edits can have different cache contents for
 the same token IDs. Keeping every pairwise score would cost quadratic space
 in context length. Block summaries or entries for frequently edited spans let
 the experiment trade cache space for repeat-edit latency.
+
+## Implemented architecture
+
+The initial design chose whole-token replay to reuse the existing model
+forward and avoid additional hidden-state or attention-output checkpoints.
+Each selected token runs all heads and layers. The approximation is that
+skipped tokens' cached K/V remains adequate after the edit. Selection uses
+cached Q throughout and freezes the mask before any suffix replay, so newly
+computed suffix Q never changes another token's selection in the same edit.
+
+| Component | Responsibility |
+| --- | --- |
+| `LLM.edit_kv_cache` | Validate the mode, explicit non-NaN threshold and reduction options, tokenize replacement text, and return edited IDs with a fresh cache salt. |
+| `SuffixSelection` and synchronous engine clients | Carry the threshold, three reductions and deletion option through in-process calls or multiprocess serialization. |
+| Engine core and `KVCacheEditor` | Check prerequisites, resolve and pin source pages, allocate private destination pages and dispatch the worker RPC before publishing cache aliases. |
+| `write_kv_cache_edit` | Seed the prefix fragment, prefill replacement tokens, copy and relocate the suffix, select runs, and replay them. |
+| `QueryCache.roundtrip_keys` | Represent affected K in the stored Q format for scoring, with the same CUDA encoder used by Q writes. |
+
+The public API accepts infinite thresholds for selecting all or none of the
+finite scores. Invalid reductions, missing or NaN thresholds, and selective
+options supplied with a boolean mode raise errors. Selective mode requires
+stored Q. Worker validation additionally checks dense floating-point K/V,
+compatible 1D RoPE, bound Q geometry and the absence of shared K/V layers.
+The underlying editing restrictions are recorded in the KV editing record.
+[Public entry point](../../vllm/entrypoints/llm.py),
+[transport types](../../vllm/v1/engine/__init__.py),
+[engine clients](../../vllm/v1/engine/core_client.py),
+[engine core](../../vllm/v1/engine/core.py).
+
+Selective edits reserve private pages through the suffix before computing
+the mask, including length-preserving replacements. This protects the source
+and provides writable destinations for any selection. An edit with no included
+affected keys follows the reuse path. The worker completes and synchronizes
+before the editor publishes the destination. Allocation or worker failures
+release temporary references without publishing the edited cache.
+[Page planning](../../vllm/v1/core/kv_cache_edit.py) and
+[worker synchronization](../../vllm/v1/worker/gpu_worker.py).
+
+### Scoring implementation
+
+`_score_key_span` processes at most 128 affected keys and 256 suffix queries
+per score tile. It represents each key tile once, then reuses it across query
+tiles and the query heads sharing that KV head. Decoded queries and represented
+keys are converted to FP32 for the dot products. This uses quantized vector
+values with floating-point arithmetic. The temporary dot tensor has dimensions
+suffix query, KV head, query within the GQA group, and affected key.
+
+Each layer keeps a suffix-by-query-head accumulator. Max starts at negative
+infinity to preserve negative scores, while sum starts at zero. Removed and
+replacement spans fold into the same accumulator before the head reduction.
+The layer result is reduced across tensor-parallel ranks using the selected
+head operation, then folded into the suffix-length layer accumulator. Sorting
+layer names makes collective order consistent across ranks. Replicated KV
+heads still pair with each rank's distinct query heads.
+
+The implementation visits every scoring layer before thresholding. With
+suffix length S, affected-key count E, query-head count H, head dimension D
+and L layers, scoring arithmetic scales as O(L S E H D). Tiling bounds the
+pairwise score tensor, while the per-layer accumulator still scales as O(S H).
+There is no persistent deleted-score cache in this implementation. The
+opportunities described above would extend the current per-call key-tile reuse.
+[Scoring and replay worker](../../vllm/v1/worker/kv_cache_edit.py).
+
+Verification exposed different division rounding between the original eager
+K conversion and the CUDA Q writer for compressed formats. Factoring the
+shared CUDA writer into `_write_cuda` made K conversion use the same scale
+and tie rounding. Compressed K uses temporary byte rows, then `_decode`
+provides represented values for scoring. Floating-point formats cast directly.
+The verification report records exact parity checks across all six formats
+and FP16, BF16 and FP32 source vectors.
+[Encoding implementation](../../vllm/v1/attention/ops/query_cache.py).
+
+### Fragmented replay implementation
+
+`_selected_runs` pads the threshold mask with false values, finds transitions
+and returns half-open, suffix-relative intervals to the host. The worker slices
+the suffix token IDs for each interval and calls `_prefill` in increasing
+position order. For example, selected offsets 2, 3, 8 and 12 produce intervals
+[2, 4), [8, 9) and [12, 13).
+
+Each call builds absolute positions, physical write slots and attention
+metadata over the destination page table. The causal prefix includes skipped
+tokens and all earlier selected tokens. Earlier runs have already refreshed
+their K/V. Within a run, normal causal attention handles dependencies between
+selected tokens. Large runs are split at `max_num_batched_tokens`.
+
+The model computes fresh Q/K/V at model precision and stores Q in its configured
+format. Reused rows were copied before selection, with RoPE relocation when
+positions changed. A full mask forms one run, and an empty mask performs zero
+suffix forwards. Many short runs incur repeated metadata construction and
+model launches. The measured fragmented mask required 15 separate forwards.
+[Measurement details](selective_suffix_repair_verification.md#warm-edit-latency).
+
+## Proposed gathered replay
+
+Gathered replay was discussed after verification and remains an unimplemented,
+unbenchmarked proposal. It would gather selected token IDs and their edited
+absolute positions in increasing order, allowing multiple separated runs to
+share one model forward. At each layer, compute fresh Q/K/V for the gathered
+tokens, scatter K/V into their actual cache slots, and evaluate each query
+against the full cache through its own absolute position. Fresh Q would be
+stored through the configured encoder.
+
+This requires attention metadata and a backend capable of enforcing a separate
+absolute causal boundary for each gathered query. `_prefill` currently assumes
+contiguous query positions. Compacting IDs alone would give incorrect causal
+boundaries. Every layer must finish writing the batch's K/V before attention
+reads it, with future positions masked. Large selections can use bounded
+batches in ascending position order, so subsequent batches see refreshed K/V
+from preceding batches.
+
+The anticipated benefit is fewer forwards and larger projection and MLP
+batches for heavily fragmented selections. Long-prefix K/V reads and the
+selection scan remain costs. The existing benchmark varied both selection
+count and fragmentation. A future comparison should run both implementations
+on identical masks, then vary run count at a fixed selected-token count across
+larger suffixes. Correctness should use the existing token-at-a-time oracle,
+including skipped-row preservation, absolute positions, page crossings and
+multiple gathered batches. No latency improvement from gathering has yet been
+measured.

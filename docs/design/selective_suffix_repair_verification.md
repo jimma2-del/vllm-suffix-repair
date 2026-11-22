@@ -70,6 +70,19 @@ Full replay was faster than every selective case on this prompt. The
 fragmented mask incurred 15 separate suffix forwards. The measurements
 include selection, cache preparation and replay together.
 
+Thresholds were chosen between adjacent distinct observed scores. The
+fragmented case maximized run count among masks containing a run that crossed
+a page boundary. The clustered case minimized run count among masks selecting
+at least three tokens, breaking ties by proximity to the fragmented token
+count. The sparsest case used the highest candidate threshold. Consequently,
+the clustered and fragmented cases selected different token counts, so this
+comparison does not isolate fragmentation alone. The source IDs were
+100 through 184, and the replacement text was ` blue`.
+[Threshold selection](../../suffix_repair_test/verify_selective_edit.py).
+
+The [architecture and gathered replay proposal](selective_suffix_repair.md#proposed-gathered-replay)
+records the follow-up optimization discussion.
+
 ## Reproduction
 
 Set `model_dir` to the local directory for the revision above. Run from the

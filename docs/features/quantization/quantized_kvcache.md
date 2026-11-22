@@ -38,6 +38,10 @@ matching TP sizes. NIXL also requires matching decode context parallel sizes.
 Cross-attention's encoder K/V and compressed latent attention caches have no
 corresponding per-token Q record.
 
+The [query-cache design record](../../design/query_cache.md) explains the
+page layout, encoding, attention integration, lifecycle handling, cache-edit
+behavior, and validation results.
+
 ## FP8 KV Cache Overview
 
 Efficient memory usage is crucial for working with large language models. Quantizing the KV (Key-Value) cache to FP8 format can significantly reduce its memory footprint. This optimization enables you to store more tokens in memory, leading to improved throughput and support for longer context windows.
