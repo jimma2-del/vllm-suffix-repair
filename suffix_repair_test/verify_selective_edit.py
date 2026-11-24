@@ -8,6 +8,7 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
+from itertools import chain
 from statistics import median
 from time import perf_counter
 from unittest.mock import patch
@@ -22,6 +23,8 @@ from suffix_repair_test.selective_reference import (
     reduce_scores,
 )
 from vllm import LLM, SamplingParams
+from vllm.v1.worker import kv_cache_edit as edit_worker
+from vllm.v1.worker.kv_cache_edit import _prefill, _selected_runs
 
 MAX = ("max",) * 3
 
@@ -84,15 +87,15 @@ class ResidentPrompt:
 
     @contextmanager
     def observe(self):
-        positions = []
+        batches = []
 
         def record(model, args, kwargs):
-            positions.extend(kwargs["positions"].tolist())
+            batches.append(kwargs["positions"].tolist())
 
         with self.runner.get_model().register_forward_pre_hook(
             record, with_kwargs=True
         ):
-            yield positions
+            yield batches
 
     @torch.inference_mode()
     def replay_individually(self, private, original, positions):
@@ -185,6 +188,33 @@ def edit_prompt(llm, source, start, end, text, mode, **options):
     )
 
 
+def prefill_separate_runs(
+    runner, token_ids, start_pos, pages, block_size, *, runs=None
+):
+    if runs is None:
+        return _prefill(runner, token_ids, start_pos, pages, block_size)
+    for start, end in runs:
+        _prefill(runner, token_ids[start:end], start_pos + start, pages, block_size)
+
+
+def verify_gathered(cache, src, edit, suffix_start, reuse, fmt):
+    runs = [(0, 3), (9, 10), (16, 17), (25, 26), (36, 37), (49, 50), (64, 66)]
+    positions = [suffix_start + p for a, b in runs for p in range(a, b)]
+    with patch.object(edit_worker, "_selected_runs", return_value=runs):
+        with cache.observe() as observed:
+            actual = cache.snapshot(edit("selective", threshold=0))
+        with patch.object(edit_worker, "_prefill", prefill_separate_runs):
+            separate = cache.snapshot(edit("selective", threshold=0))
+    suffix_batches = [batch for batch in observed if batch[0] >= suffix_start]
+    assert list(chain.from_iterable(suffix_batches)) == positions
+    assert 1 < len(suffix_batches) < len(runs), suffix_batches
+    assert any(rows[-1] - rows[0] + 1 > len(rows) for rows in suffix_batches)
+    check_sparse(actual, reuse, separate, positions, fmt)
+    private = edit("selective", threshold=float("inf"))
+    cache.replay_individually(private, src, positions)
+    check_sparse(actual, reuse, cache.snapshot(private), positions, fmt)
+
+
 def threshold_cases(scores, suffix_start, page_size):
     # Choose deterministic masks from the measured scores. Prefer equal counts
     # when two thresholds give similarly dense clustered and fragmented cases.
@@ -245,6 +275,62 @@ def benchmark(llm, source, start, end, text, cases, fmt, repeats):
         ),
         flush=True,
     )
+
+
+def benchmark_fixed_masks(edit, suffix_len, repeats):
+    select_start, select_end, replay_start, replay_end = (
+        torch.cuda.Event(enable_timing=True) for _ in range(4)
+    )
+
+    def measure(fixed_runs, replay):
+        def score(*args):
+            select_start.record()
+            _selected_runs(*args)  # Include the real selection cost in the edit.
+            select_end.record()
+            return fixed_runs
+
+        def timed_prefill(*args, runs=None):
+            if runs is None:
+                return _prefill(*args)
+            replay_start.record()
+            replay(*args, runs=runs)
+            replay_end.record()
+
+        with (
+            patch.object(edit_worker, "_prefill", timed_prefill),
+            patch.object(edit_worker, "_selected_runs", score),
+        ):
+            started = perf_counter()
+            edit("selective", threshold=0)
+            edit_ms = (perf_counter() - started) * 1000
+        # The edit RPC has synchronized the device before publishing pages.
+        return {
+            "edit_ms": edit_ms,
+            "selection_ms": select_start.elapsed_time(select_end),
+            "replay_ms": replay_start.elapsed_time(replay_end),
+        }
+
+    # All masks share a midpoint, so the sum of causal prefix lengths is fixed.
+    for run_count in (1, 4, 16):
+        width = 16 // run_count
+        left = (suffix_len - 16 - 2 * (run_count - 1)) // 2
+        runs = [
+            (left + i * (width + 2), left + i * (width + 2) + width)
+            for i in range(run_count)
+        ]
+        methods = [("gather", _prefill), ("runs", prefill_separate_runs)]
+        samples = {label: [] for label, _ in methods}
+        for i in range(repeats + 1):
+            for label, replay in methods:
+                sample = measure(runs, replay)
+                if i:
+                    samples[label].append(sample)
+            methods.reverse()
+        print(
+            "FIXED_MASK",
+            json.dumps({"suffix_runs": runs, "samples": samples}),
+            flush=True,
+        )
 
 
 def verify_inproc(llm, src, fmt, repeats):
@@ -317,7 +403,8 @@ def verify_inproc(llm, src, fmt, repeats):
                     edit("selective", threshold=threshold, **options)
                 selected = (scores > threshold).nonzero().flatten() + suffix_start
                 assert (
-                    observed == list(range(start, suffix_start)) + selected.tolist()
+                    list(chain.from_iterable(observed))
+                    == list(range(start, suffix_start)) + selected.tolist()
                 ), (label, ops)
             if label == "equal":
                 cases = threshold_cases(
@@ -340,7 +427,9 @@ def verify_inproc(llm, src, fmt, repeats):
                     same_state(cache.snapshot(sparse), actual)
                 if repeats:
                     benchmark(llm, src, start, end, text, cases, fmt, repeats)
+                    benchmark_fixed_masks(edit, len(scores), repeats)
             if label == "contract":
+                verify_gathered(cache, src, edit, suffix_start, reuse, fmt)
                 # Old and new queries have different RoPE coordinates here.
                 new_terms = score_terms(
                     before, reuse, start, end, suffix_start, fmt, False
@@ -350,7 +439,7 @@ def verify_inproc(llm, src, fmt, repeats):
                 with cache.observe() as observed:
                     edit("selective", threshold=threshold, include_deleted=False)
                 assert (
-                    observed
+                    list(chain.from_iterable(observed))
                     == list(range(start, suffix_start))
                     + ((scores > threshold).nonzero().flatten() + suffix_start).tolist()
                 )

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+from collections.abc import Iterator, Sequence
+from itertools import accumulate
 from typing import TYPE_CHECKING
 
 import torch
@@ -15,6 +17,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.ops.query_cache import QueryCache
 from vllm.v1.core.kv_cache_edit import KVCacheEdit
 from vllm.v1.engine import ScoreReduction
+from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
     build_slot_mappings_by_layer,
@@ -43,20 +46,55 @@ def _relocate_keys(
     )
 
 
+def _replay_batches(
+    runs: Sequence[Sequence[int]], max_tokens: int, max_seqs: int
+) -> Iterator[list[tuple[int, int]]]:
+    """Pack sorted, disjoint suffix runs within the runner's batch limits."""
+    batch: list[tuple[int, int]] = []
+    count = 0
+    for start, end in runs:
+        while start < end:
+            stop = min(end, start + max_tokens - count)
+            batch.append((start, stop))
+            count += stop - start
+            start = stop
+            if count == max_tokens or len(batch) == max_seqs:
+                yield batch
+                batch = []
+                count = 0
+    if batch:
+        yield batch
+
+
+def _max_replay_seqs(runner: GPUModelRunner | GPUModelRunnerV2) -> int:
+    limit = runner.vllm_config.scheduler_config.max_num_seqs
+    if any(g.backend.get_name() != "TRITON_ATTN" for g in runner.attn_groups[0]):
+        limit = 1
+    if runner.vllm_config.parallel_config.tensor_parallel_size > 1:
+        # All ranks must enter the same model collectives even if a backend differs.
+        shared = torch.tensor(limit, dtype=torch.int32, device="cpu")
+        dist.all_reduce(shared, op=dist.ReduceOp.MIN, group=get_tp_group().cpu_group)
+        limit = int(shared.item())
+    return limit
+
+
 def _prefill(
     runner: GPUModelRunner | GPUModelRunnerV2,
     token_ids: list[int],
     start_pos: int,
     pages: torch.Tensor,
     block_size: int,
+    *,
+    runs: Sequence[Sequence[int]] | None = None,
 ) -> None:
-    """Prefill a segment after the KV already present in the destination pages."""
-    if not token_ids:
+    """Replay the requested rows against the same paged causal prefix."""
+    if runs is None:
+        runs = [(0, len(token_ids))]
+    if not runs or not token_ids:
         return
     device = runner.device
     model = runner.get_model()
-    ids = torch.tensor(token_ids, dtype=torch.long, device=device)
-    pages = pages[: cdiv(start_pos + len(token_ids), block_size)].int()
+    pages = pages[: cdiv(start_pos + runs[-1][1], block_size)].int()
     (kernel_size,) = prepare_kernel_block_sizes(
         runner.kv_cache_config, runner.attn_groups
     )
@@ -64,40 +102,60 @@ def _prefill(
     table = (
         pages[:, None] * ratio + torch.arange(ratio, dtype=pages.dtype, device=device)
     ).reshape(1, -1)
-    chunk_size = runner.vllm_config.scheduler_config.max_num_batched_tokens
-    for chunk in ids.split(chunk_size):
-        count = chunk.numel()
-        end = start_pos + count
-        positions = torch.arange(start_pos, end, device=device)
-        slots = _slots(pages, positions, block_size)
-        query_start = torch.tensor([0, count], dtype=torch.int32, device="cpu")
-        seq_len = torch.tensor([end], dtype=torch.int32, device="cpu")
-        slots = slots.unsqueeze(0)
+    # Attention can load block indices for a full final key tile.
+    width = get_block_table_width(table.shape[1], kernel_size)
+    if width > table.shape[1]:
+        table = torch.nn.functional.pad(table, (0, width - table.shape[1]))
+
+    scheduler = runner.vllm_config.scheduler_config
+    max_seqs = _max_replay_seqs(runner) if len(runs) > 1 else 1
+
+    for batch in _replay_batches(runs, scheduler.max_num_batched_tokens, max_seqs):
+        num_reqs = len(batch)
+        ends = [start_pos + end for _, end in batch]
+        lengths = [end - start for start, end in batch]
+        if num_reqs == 1:
+            start, end = batch[0]
+            ids = torch.tensor(token_ids[start:end], dtype=torch.long, device=device)
+            positions = torch.arange(start_pos + start, ends[0], device=device)
+        else:
+            offsets = [i for start, end in batch for i in range(start, end)]
+            ids, positions = torch.tensor(
+                [[token_ids[i] for i in offsets], [start_pos + i for i in offsets]],
+                dtype=torch.long,
+                device=device,
+            ).unbind()
+        slots = _slots(pages, positions, block_size).unsqueeze(0)
+        query_start = torch.tensor(
+            [0, *accumulate(lengths)], dtype=torch.int32, device="cpu"
+        )
+        seq_lens = torch.tensor(ends, dtype=torch.int32, device="cpu")
+        # Each run is a sequence view of the same cache. For packed row j in
+        # a run, Triton's causal boundary is seq_len - query_len + j.
         metadata = build_attn_metadata(
             runner.attn_groups,
-            num_reqs=1,
-            num_tokens=count,
+            num_reqs=num_reqs,
+            num_tokens=ids.numel(),
             query_start_loc_gpu=query_start.to(device),
             query_start_loc_cpu=query_start,
-            seq_lens=seq_len.to(device),
-            seq_lens_cpu_upper_bound=seq_len,
-            max_query_len=count,
-            max_seq_len=end,
-            block_tables=[table],
+            seq_lens=seq_lens.to(device),
+            seq_lens_cpu_upper_bound=seq_lens,
+            max_query_len=max(lengths),
+            max_seq_len=ends[-1],
+            block_tables=[table.expand(num_reqs, -1)],
             slot_mappings=slots,
             kv_cache_config=runner.kv_cache_config,
             positions=positions,
-            is_prefilling=torch.tensor([True], device="cpu"),
+            is_prefilling=torch.ones(num_reqs, dtype=torch.bool, device="cpu"),
         )
         with set_forward_context(
             metadata,
             runner.vllm_config,
-            num_tokens=count,
+            num_tokens=ids.numel(),
             slot_mapping=build_slot_mappings_by_layer(slots, runner.kv_cache_config),
             skip_compiled=True,
         ):
-            model(input_ids=chunk, positions=positions)
-        start_pos = end
+            model(input_ids=ids, positions=positions)
 
 
 def _slots(
@@ -318,11 +376,11 @@ def write_kv_cache_edit(
         )
     if edit.selection is not None:
         assert edit.suffix_ids is not None
-        for start, end in _selected_runs(edit, layers, source, destination):
-            _prefill(
-                runner,
-                edit.suffix_ids[start:end],
-                suffix_start + start,
-                destination,
-                edit.block_size,
-            )
+        _prefill(
+            runner,
+            edit.suffix_ids,
+            suffix_start,
+            destination,
+            edit.block_size,
+            runs=_selected_runs(edit, layers, source, destination),
+        )

@@ -9,7 +9,7 @@ The boolean modes select suffix reuse (`False`) or full suffix replay (`True`).
 [verification plan](selective_suffix_repair_plan.md#verification-plan).
 
 This document records the selection design, implemented architecture and
-follow-up proposals discussed through November 21, 2026. The
+follow-up proposals discussed through November 24, 2026. The
 [KV editing record](kv_cache_editing.md) covers the underlying API, page
 ownership and publication protocol. The [query storage record](query_cache.md)
 covers page layout, encoding and lifecycle integration. The
@@ -236,49 +236,49 @@ and FP16, BF16 and FP32 source vectors.
 
 ### Fragmented replay implementation
 
-`_selected_runs` pads the threshold mask with false values, finds transitions
-and returns half-open, suffix-relative intervals to the host. The worker slices
-the suffix token IDs for each interval and calls `_prefill` in increasing
-position order. For example, selected offsets 2, 3, 8 and 12 produce intervals
-[2, 4), [8, 9) and [12, 13).
+`_selected_runs` freezes the threshold mask after scoring every layer and
+returns sorted, half-open suffix intervals to the host. Both replay schedules
+use these intervals. An empty mask skips the suffix forward. A full mask
+prefills one contiguous run, split at the runner's token limit.
 
-Each call builds absolute positions, physical write slots and attention
-metadata over the destination page table. The causal prefix includes skipped
-tokens and all earlier selected tokens. Earlier runs have already refreshed
-their K/V. Within a run, normal causal attention handles dependencies between
-selected tokens. Large runs are split at `max_num_batched_tokens`.
+The original worker forwarded each run separately. Its 15-run measurement
+predates gathered replay. This schedule also supports edit-compatible
+backends other than Triton. [Original measurements](selective_suffix_repair_verification.md#warm-edit-latency).
 
-The model computes fresh Q/K/V at model precision and stores Q in its configured
-format. Reused rows were copied before selection, with RoPE relocation when
-positions changed. A full mask forms one run, and an empty mask performs zero
-suffix forwards. Many short runs incur repeated metadata construction and
-model launches. The measured fragmented mask required 15 separate forwards.
-[Measurement details](selective_suffix_repair_verification.md#warm-edit-latency).
+<a id="proposed-gathered-replay"></a>
 
-## Proposed gathered replay
+## Gathered replay on Triton
 
-Gathered replay was discussed after verification and remains an unimplemented,
-unbenchmarked proposal. It would gather selected token IDs and their edited
-absolute positions in increasing order, allowing multiple separated runs to
-share one model forward. At each layer, compute fresh Q/K/V for the gathered
-tokens, scatter K/V into their actual cache slots, and evaluate each query
-against the full cache through its own absolute position. Fresh Q would be
-stored through the configured encoder.
+When all editing layers use `TRITON_ATTN`, the worker gathers selected IDs
+from the host token list and passes their edited absolute positions to RoPE.
+Each contiguous run becomes one sequence in Triton's variable-length batch.
+The runs share a single destination page table through a tensor view with zero
+row stride. Projections and MLPs process the packed rows together.
 
-This requires attention metadata and a backend capable of enforcing a separate
-absolute causal boundary for each gathered query. `_prefill` currently assumes
-contiguous query positions. Compacting IDs alone would give incorrect causal
-boundaries. Every layer must finish writing the batch's K/V before attention
-reads it, with future positions masked. Large selections can use bounded
-batches in ascending position order, so subsequent batches see refreshed K/V
-from preceding batches.
+For example, selecting absolute positions 2, 3, 8 and 12 produces four model
+input rows and three sequence views.
 
-The anticipated benefit is fewer forwards and larger projection and MLP
-batches for heavily fragmented selections. Long-prefix K/V reads and the
-selection scan remain costs. The existing benchmark varied both selection
-count and fragmentation. A future comparison should run both implementations
-on identical masks, then vary run count at a fixed selected-token count across
-larger suffixes. Correctness should use the existing token-at-a-time oracle,
-including skipped-row preservation, absolute positions, page crossings and
-multiple gathered batches. No latency improvement from gathering has yet been
-measured.
+| Packed rows | Edited positions | Query length | Visible prefix length at run end |
+| --- | --- | ---: | ---: |
+| 0, 1 | 2, 3 | 2 | 4 |
+| 2 | 8 | 1 | 9 |
+| 3 | 12 | 1 | 13 |
+
+Here `query_start_loc` is `[0, 2, 3, 4]` and `seq_lens` is `[4, 9, 13]`.
+Within each run, the kernel computes the causal boundary as
+`seq_len - query_len + row_in_run`. Row 2 therefore reads positions 0
+through 8, including skipped tokens and the fresh K/V at positions 2 and 3.
+Both the tiled and split-K kernels use these per-run lengths to bound key
+reads. The block table includes padding for the final key tile.
+[Attention kernel](../../vllm/v1/attention/ops/triton_unified_attention.py).
+
+Each layer writes the batch's K/V at its destination slots before attention
+reads the shared cache. The Q encoder records the fresh queries at those
+same slots. Earlier batches finish before later batches start. A batch
+contains at most `max_num_batched_tokens` selected rows and `max_num_seqs`
+runs. Tensor-parallel ranks use the smallest supported run limit across the
+group. [Edit worker](../../vllm/v1/worker/kv_cache_edit.py).
+
+The [gathered replay proposal audit](selective_suffix_repair_proposal_audit.md)
+records the original design questions. The [verification commands](selective_suffix_repair_verification.md#gathered-replay-checks)
+cover cache parity and a same-mask timing comparison on an A100.

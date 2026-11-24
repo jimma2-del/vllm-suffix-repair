@@ -117,3 +117,44 @@ done
 On a two-GPU host, the unit suite also enables the NCCL rank-mask comparison.
 Run `verify 1 1 --tp 2` for the pretrained model and
 `verify 1 1 --tp 2 --fixture-kv-heads 1` for replicated KV in a model forward.
+
+## Gathered replay checks
+
+On November 24, 2026, all 20 CPU tests across the replay, scoring, Q cache
+and editor suites passed with PyTorch 2.14.0+cpu and Python 3.12. From the
+repository root, run the suites with the project environment.
+
+```bash
+OMP_NUM_THREADS=1 .venv/bin/python -m unittest -v \
+    suffix_repair_test.test_gathered_replay suffix_repair_test.test_selective_suffix \
+    suffix_repair_test.test_query_cache suffix_repair_test.test_kv_cache_edit
+```
+
+The CPU checks build Triton metadata for fragmented, contiguous, singleton
+and empty masks. They verify gathered IDs, absolute positions, physical
+slots, causal prefixes and both batch limits. A two-layer uniform-attention
+fixture compares gathered cache writes with serial token replay. Two Gloo
+ranks check that every rank uses the same batches, including when only one
+rank supports gathering. [Replay tests](../../suffix_repair_test/test_gathered_replay.py).
+
+On an A100 the same suite also compares paged Triton attention against dense
+FP32 prefixes for MHA, GQA and MQA. It exercises short queries that fit the
+split-K workspace and a larger batch that selects the 2D kernel. For the full
+model check, set `model_dir` to the local Qwen2.5 model described above.
+
+```bash
+HF_HUB_OFFLINE=1 VLLM_USE_V2_MODEL_RUNNER=1 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+    .venv/bin/python -m suffix_repair_test.verify_selective_edit "$model_dir" \
+    --q-format int4 --repeats 7
+```
+
+The model check compares each layer's K/V and stored Q with separate runs
+and the token-at-a-time oracle for the same seven-run mask after a contraction.
+It checks skipped rows and the source cache exactly. With `--repeats`, the
+`FIXED_MASK` records compare 16 selected tokens in 1, 4 and 16 runs. Their
+mean absolute position is fixed, so the total number of causal keys is also
+fixed. Each edit pays the real scoring cost before the harness substitutes
+the specified mask. Samples report wall time for the complete edit and CUDA
+event intervals for selection and suffix replay. Each schedule warms up once
+and their measurement order alternates. GPU correctness and latency for this
+implementation await an A100 run. [Model verification and benchmark](../../suffix_repair_test/verify_selective_edit.py).
