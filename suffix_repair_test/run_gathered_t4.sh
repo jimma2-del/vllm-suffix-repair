@@ -5,7 +5,7 @@ model_dir=${1:?Pass the local Qwen2.5-1.5B-Instruct model directory}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 export HF_HUB_OFFLINE=1 VLLM_USE_V2_MODEL_RUNNER=1 VLLM_ENABLE_V1_MULTIPROCESSING=0
 
-.venv/bin/python - <<'PY'
+python - <<'PY'
 import torch
 
 if not torch.cuda.is_available():
@@ -16,7 +16,7 @@ if "T4" not in name.split() or torch.cuda.get_device_capability(0) != (7, 5):
 print(f"Running gathered replay on {name} with PyTorch {torch.__version__}")
 PY
 
-.venv/bin/python -m unittest -v \
+python -m unittest -v \
     suffix_repair_test.test_gathered_replay.GatheredReplayTest.test_triton_attention_against_dense_prefixes
-.venv/bin/python -m suffix_repair_test.verify_selective_edit "$model_dir" \
+python -m suffix_repair_test.verify_selective_edit "$model_dir" \
     --tp 1 --q-format int4 --repeats 7

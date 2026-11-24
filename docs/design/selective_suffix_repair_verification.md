@@ -93,11 +93,11 @@ export OMP_NUM_THREADS=1 HF_HUB_OFFLINE=1 VLLM_LOGGING_LEVEL=ERROR
 .venv/bin/python -m unittest -v suffix_repair_test.test_kv_cache_edit \
     suffix_repair_test.test_query_cache suffix_repair_test.test_selective_suffix
 VLLM_USE_V2_MODEL_RUNNER=1 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
-    .venv/bin/python -m suffix_repair_test.kv_cache_edit_gpu "$model_dir"
+    python -m suffix_repair_test.kv_cache_edit_gpu "$model_dir"
 
 verify() {
     VLLM_USE_V2_MODEL_RUNNER="$1" VLLM_ENABLE_V1_MULTIPROCESSING="$2" \
-        .venv/bin/python -m suffix_repair_test.verify_selective_edit \
+        python -m suffix_repair_test.verify_selective_edit \
         "$model_dir" "${@:3}"
 }
 
@@ -137,6 +137,7 @@ fixture compares gathered cache writes with serial token replay. Two Gloo
 ranks check that every rank uses the same batches, including when only one
 rank supports gathering. [Replay tests](../../suffix_repair_test/test_gathered_replay.py).
 
+In a T4 or A100 Colab runtime, use `python` for the commands above.
 On a T4 the same suite also compares paged Triton attention against dense
 FP32 prefixes for MHA, GQA and MQA. It exercises short queries that fit the
 split-K workspace and a larger batch that selects the 2D kernel. For the full

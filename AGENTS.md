@@ -6,8 +6,9 @@ iterative experimentation and clear, reproducible research results.
 
 ## Development Workflow
 
-- Never use system `python3` or bare `pip`/`pip install`. Use `uv` and
-  `.venv/bin/python` for Python environment management and commands.
+- Locally, use `uv` and `.venv/bin/python`. Avoid system `python3` and bare `pip`.
+- Run T4 and A100 tests and benchmarks in Colab with the active runtime's
+  `python`. Skip virtual environment creation and activation in Colab.
 
 ### Environment setup
 
