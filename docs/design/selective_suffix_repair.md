@@ -281,4 +281,4 @@ group. [Edit worker](../../vllm/v1/worker/kv_cache_edit.py).
 
 The [gathered replay proposal audit](selective_suffix_repair_proposal_audit.md)
 records the original design questions. The [verification commands](selective_suffix_repair_verification.md#gathered-replay-checks)
-cover cache parity and a same-mask timing comparison on an A100.
+cover cache parity and a same-mask timing comparison on a T4.
