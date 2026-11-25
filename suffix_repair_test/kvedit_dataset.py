@@ -5,9 +5,9 @@
 import json
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from io import TextIOWrapper
 from itertools import islice
 from pathlib import Path
+from shutil import copyfileobj
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
@@ -15,7 +15,7 @@ KVEDIT_REVISION = "c24fbaf72a44b863d564d23310557cc66bd0b5b5"
 KVEDIT_DATA_URL = (
     f"https://raw.githubusercontent.com/mingyangmao/KVEdit/{KVEDIT_REVISION}/data/"
 )
-DEFAULT_DATASET = KVEDIT_DATA_URL + "heldout_pairs.jsonl"
+DEFAULT_DATASET = KVEDIT_DATA_URL + "pilot_pairs.jsonl"
 CONDITIONS = ("direct", "derived")
 
 _OFFICIAL_MODELS = {
@@ -86,13 +86,38 @@ def _read_cases(file, conditions, offset, limit):
             )
 
 
+def fetch_dataset(source: str | Path, destination: Path) -> Path:
+    """Return a local path after downloading a remote dataset in full."""
+    url = str(source)
+    if urlparse(url).scheme not in ("http", "https"):
+        return Path(source).expanduser().resolve(strict=True)
+
+    partial = destination.with_name(destination.name + ".part")
+    try:
+        with (
+            urlopen(url, timeout=30) as response,  # noqa: S310
+            partial.open("wb") as file,
+        ):
+            copyfileobj(response, file)
+            expected_bytes = response.headers.get("Content-Length")
+            if expected_bytes is not None and file.tell() != int(expected_bytes):
+                raise OSError(
+                    f"Incomplete dataset download: expected {expected_bytes} bytes, "
+                    f"got {file.tell()}"
+                )
+        partial.replace(destination)
+    finally:
+        partial.unlink(missing_ok=True)
+    return destination.resolve()
+
+
 def load_cases(
     path: str | Path,
     conditions: Iterable[str] = CONDITIONS,
     offset: int = 0,
     limit: int | None = None,
 ) -> Iterator[Case]:
-    """Yield selected conditions from a local JSONL file or public dataset URL.
+    """Yield selected conditions from a local JSONL file.
 
     Offset and limit count source pairs before expanding their conditions.
     """
@@ -101,16 +126,8 @@ def load_cases(
         raise ValueError("Dataset offset and limit must be nonnegative.")
     if any(condition not in CONDITIONS for condition in conditions):
         raise ValueError(f"Conditions must be chosen from {CONDITIONS}.")
-    source = str(path)
-    if urlparse(source).scheme in ("http", "https"):
-        with (
-            urlopen(source, timeout=30) as response,  # noqa: S310
-            TextIOWrapper(response, encoding="utf-8") as file,
-        ):
-            yield from _read_cases(file, conditions, offset, limit)
-    else:
-        with Path(path).open(encoding="utf-8") as file:
-            yield from _read_cases(file, conditions, offset, limit)
+    with Path(path).open(encoding="utf-8") as file:
+        yield from _read_cases(file, conditions, offset, limit)
 
 
 def _edit_bounds(old: list[int], new: list[int]) -> tuple[int, int, int]:

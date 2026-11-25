@@ -1,8 +1,8 @@
 # Run the KVEdit benchmark
 
 Run the benchmark from the repository root with this checkout of vLLM
-installed. The default dataset is KVEdit's pinned held-out split. Each pair
-includes a direct edit and a derived edit. [KVEdit dataset and format](https://github.com/mingyangmao/KVEdit#data-files)
+installed. The default dataset is KVEdit's pinned development split,
+`pilot_pairs.jsonl`. Each pair includes a direct edit and a derived edit. [KVEdit dataset and format](https://github.com/mingyangmao/KVEdit#data-files)
 
 ## Colab
 
@@ -24,10 +24,14 @@ python -m suffix_repair_test.bench_kvedit --limit 2 \
   --output-dir /content/drive/MyDrive/kvedit-t4-smoke
 ```
 
-Omit `--limit` to run the entire file. Use `--dataset` with a local KVEdit
-JSONL file or its raw GitHub URL to select the pilot or a distance variant.
-For example, run `--dataset /content/KVEdit/data/ext_d1500_pairs.jsonl`
-to benchmark the 1,500-token distance file.
+Use `--dataset` with a local KVEdit JSONL file or its raw GitHub URL to
+select another split. For example, use
+`--dataset /content/KVEdit/data/heldout_pairs.jsonl` for the held-out split.
+
+For a URL, the benchmark downloads the entire file to `dataset.jsonl` in the
+output directory before loading the model. It applies `--offset` and `--limit`
+when reading the local file. Pass that saved file to `--dataset` to reuse it.
+Omit `--limit` to benchmark every pair in the file.
 
 The default sweep tests raw selection thresholds 0.5, 32, 256, 2048, and
 16384. Use `--thresholds 32 128 512` to replace the sweep. The selector
@@ -81,8 +85,9 @@ Each run creates a new directory. The default location is
 `data/kvedit-results/kvedit-<timestamp>`. The files contain the
 following measurements and reproduction inputs.
 
-- `config.json` records the dataset source, CLI settings, engine options,
-  device, software versions, and script hashes.
+- `config.json` records the dataset source and local path, CLI settings,
+  engine options, device, software versions, and script hashes.
+- `dataset.jsonl` holds the complete input file for a URL source.
 - `cases.jsonl` records the exact input token IDs, edit spans, and gold answers.
   It also records cases skipped because they exceed the model length.
 - `runs.jsonl` records both stages, their timings, generated answers, cache

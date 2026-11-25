@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
 import unittest
+from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -13,10 +14,54 @@ from suffix_repair_test.bench_kvedit import (
     summarize,
     trial_variants,
 )
-from suffix_repair_test.kvedit_dataset import PreparedCase
+from suffix_repair_test.kvedit_dataset import PreparedCase, fetch_dataset, load_cases
 
 
 class KVEditBenchmarkTest(unittest.TestCase):
+    def test_downloads_full_development_split_before_limiting(self):
+        with patch("sys.argv", ["bench_kvedit"]):
+            source = parse_args().dataset
+        self.assertTrue(source.endswith("/pilot_pairs.jsonl"))
+        pair = dict(
+            question_block="Which value?",
+            answer_old="old",
+            answer_new="new",
+            conditions={"direct": {"context_old": "old", "context_new": "new"}},
+        )
+        payload = "".join(
+            json.dumps(dict(pair, pair_id=pair_id)) + "\n" for pair_id in ("a", "b")
+        ).encode()
+        response = BytesIO(payload)
+        response.headers = {"Content-Length": str(len(payload))}
+        with (
+            TemporaryDirectory() as tmp,
+            patch(
+                "suffix_repair_test.kvedit_dataset.urlopen", return_value=response
+            ) as open_url,
+        ):
+            local_path = fetch_dataset(source, Path(tmp) / "dataset.jsonl")
+            self.assertEqual(local_path.read_bytes(), payload)
+            self.assertTrue(response.closed)
+            cases = list(load_cases(local_path, ("direct",), limit=1))
+            self.assertEqual([case.pair_id for case in cases], ["a"])
+            self.assertEqual(
+                fetch_dataset(local_path, Path(tmp) / "unused"), local_path
+            )
+            open_url.assert_called_once_with(source, timeout=30)
+
+    def test_incomplete_download_leaves_no_dataset(self):
+        response = BytesIO(b"partial")
+        response.headers = {"Content-Length": "100"}
+        with (
+            TemporaryDirectory() as tmp,
+            patch("suffix_repair_test.kvedit_dataset.urlopen", return_value=response),
+        ):
+            with self.assertRaisesRegex(OSError, "Incomplete dataset download"):
+                fetch_dataset(
+                    "https://example.com/data.jsonl", Path(tmp) / "dataset.jsonl"
+                )
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
     def test_default_sweep_and_override(self):
         with patch("sys.argv", ["bench_kvedit"]):
             variants = list(trial_variants(parse_args()))

@@ -23,6 +23,7 @@ from suffix_repair_test.kvedit_dataset import (
     CONDITIONS,
     DEFAULT_DATASET,
     PROMPT_STYLES,
+    fetch_dataset,
     load_cases,
     prepare,
 )
@@ -33,7 +34,9 @@ DEFAULT_THRESHOLDS = (0.5, 32.0, 256.0, 2048.0, 16384.0)
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--dataset", default=DEFAULT_DATASET, help="KVEdit JSONL path or URL"
+        "--dataset",
+        default=DEFAULT_DATASET,
+        help="KVEdit JSONL path or URL (default: pinned development split)",
     )
     parser.add_argument("--model", default="Qwen/Qwen3-8B")
     parser.add_argument("--revision", help="Model and tokenizer revision")
@@ -387,7 +390,7 @@ def summarize(path):
     return summary
 
 
-def run(args, llm, sampling_params, block_size, output_dir):
+def run(args, llm, sampling_params, block_size, output_dir, *, dataset_path):
     variants = list(trial_variants(args))
     journal_path = output_dir / "runs.jsonl"
     case_count = 0
@@ -398,7 +401,7 @@ def run(args, llm, sampling_params, block_size, output_dir):
             (output_dir / "cases.jsonl").open("w", encoding="utf-8") as cases_file,
         ):
             for case in load_cases(
-                args.dataset, dict.fromkeys(args.conditions), args.offset, args.limit
+                dataset_path, dict.fromkeys(args.conditions), args.offset, args.limit
             ):
                 info = {
                     "pair_id": case.pair_id,
@@ -494,6 +497,8 @@ def main():
     )
     output_dir.mkdir(parents=True, exist_ok=False)
     print(f"Saving benchmark results to {output_dir.resolve()}", flush=True)
+    dataset_path = fetch_dataset(args.dataset, output_dir / "dataset.jsonl")
+    print(f"Using local dataset {dataset_path}", flush=True)
 
     options = {
         "model": args.model,
@@ -518,6 +523,7 @@ def main():
         )
     manifest = {
         "args": dict(vars(args), output_dir=str(output_dir.resolve())),
+        "dataset_path": str(dataset_path),
         "engine_options": options,
         "git_revision": git_revision(),
         "script_sha256": {
@@ -545,7 +551,9 @@ def main():
         model_commit=getattr(config.model_config.hf_config, "_commit_hash", None),
     )
     write_json(output_dir / "config.json", manifest)
-    for row in run(args, llm, SamplingParams, block_size, output_dir):
+    for row in run(
+        args, llm, SamplingParams, block_size, output_dir, dataset_path=dataset_path
+    ):
         if row["stage"] == "edited":
             print(json.dumps(row), flush=True)
 
