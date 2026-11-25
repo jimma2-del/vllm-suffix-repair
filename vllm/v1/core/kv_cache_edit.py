@@ -161,12 +161,13 @@ class KVCacheEditor:
             source.append(blocks[0])
 
         selection = recompute_suffix if isinstance(recompute_suffix, dict) else None
-        if (
-            selection is not None
-            and not replacement_ids
-            and (start == end or not selection["include_deleted"])
+        if selection is not None and (
+            selection.get("top_k") == 0
+            or (
+                not replacement_ids
+                and (start == end or not selection["include_deleted"])
+            )
         ):
-            # With no keys to score the ordinary suffix reuse path is sufficient.
             selection = None
         replay_suffix = recompute_suffix is True or selection is not None
         num_pages = cdiv(edited.num_tokens, size)

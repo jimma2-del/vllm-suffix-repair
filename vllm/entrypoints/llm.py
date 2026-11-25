@@ -847,6 +847,7 @@ class LLM(
         cache_salt: str | None = None,
         recompute_suffix: bool | Literal["selective"] = False,
         threshold: float | None = None,
+        top_k: int | None = None,
         key_reduction: ScoreReduction = "max",
         head_reduction: ScoreReduction = "max",
         layer_reduction: ScoreReduction = "max",
@@ -870,6 +871,9 @@ class LLM(
                 recomputes it in full. "selective" uses cached Q to choose
                 whole tokens to replay through all layers at model precision.
             threshold: In selective mode, replay scores strictly above this value.
+                Specify exactly one of threshold and top_k.
+            top_k: Replay up to this many highest-scoring suffix tokens in
+                selective mode. A tie favors the earlier suffix position.
             key_reduction: Reduce signed Q·K scores across affected keys.
             head_reduction: Reduce the resulting scores across query heads.
             layer_reduction: Reduce the head-reduced scores across layers.
@@ -892,24 +896,31 @@ class LLM(
         policy: bool | SuffixSelection
         reductions = (key_reduction, head_reduction, layer_reduction)
         if recompute_suffix == "selective":
-            if threshold is None or math.isnan(threshold):
-                raise ValueError(
-                    "Selective recomputation requires a non-NaN threshold."
-                )
+            if (threshold is None) == (top_k is None):
+                raise ValueError("Specify exactly one of threshold and top_k.")
             if any(op not in ("sum", "max") for op in reductions):
                 raise ValueError("Score reductions must be 'max' or 'sum'.")
             if not isinstance(include_deleted, bool):
                 raise TypeError("include_deleted must be a boolean.")
             policy = SuffixSelection(
-                threshold=float(threshold),
                 key_reduction=key_reduction,
                 head_reduction=head_reduction,
                 layer_reduction=layer_reduction,
                 include_deleted=include_deleted,
             )
+            if top_k is not None:
+                if type(top_k) is not int or top_k < 0:
+                    raise ValueError("top_k must be a nonnegative integer.")
+                policy["top_k"] = min(top_k, len(original) - end)
+            else:
+                assert threshold is not None
+                if math.isnan(threshold):
+                    raise ValueError("The selection threshold cannot be NaN.")
+                policy["threshold"] = float(threshold)
         elif isinstance(recompute_suffix, bool):
             if (
                 threshold is not None
+                or top_k is not None
                 or not include_deleted
                 or reductions != ("max",) * 3
             ):

@@ -158,3 +158,11 @@ the specified mask. Samples report wall time for the complete edit and CUDA
 event intervals for selection and suffix replay. Each schedule warms up once
 and their measurement order alternates. GPU correctness and latency for this
 implementation await a T4 run. [Model verification and benchmark](../../suffix_repair_test/verify_selective_edit.py).
+
+The same command reports threshold and top-k edit wall times in `LATENCY`.
+The script checks that each pair replays the same token positions before
+timing. `SELECTOR_LATENCY` reports wall time in microseconds to turn
+precomputed FP32 scores into replay ranges on the host. The script compares
+both policies on the same tie-free scores for 68, 4,096, and 32,768 tokens,
+with a top-k budget of about 5%. The interval starts after scoring and ends
+before replay.

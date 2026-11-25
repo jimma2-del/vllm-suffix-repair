@@ -40,19 +40,31 @@ class KVCacheEditTest(unittest.TestCase):
         return pages
 
     def test_equal_length_shares_only_untouched_pages(self):
-        write = Mock()
-        replacement = [91, 92]
-        edited_ids = self.ids[:5] + replacement + self.ids[7:]
-        salt = self.editor.edit(self.ids, replacement, 5, 7, "source", write)
-        plan = write.call_args.args[0]
-        self.assertEqual(plan.destination, self.lookup(edited_ids, salt))
-        self.assertEqual(plan.source, self.lookup(self.ids, "source"))
-        self.assertIsNone(plan.suffix_ids)
-        self.assertEqual(plan.destination[:1], plan.source[:1])
-        self.assertNotEqual(plan.destination[1], plan.source[1])
-        self.assertEqual(plan.destination[2:], plan.source[2:])
-        self.assertEqual(plan.copy_end, 8)
-        self.assertEqual([b.ref_cnt for b in self.pages], [1] * len(self.pages))
+        top_k = dict(
+            top_k=0,
+            key_reduction="max",
+            head_reduction="max",
+            layer_reduction="max",
+            include_deleted=True,
+        )
+        for mode in (False, top_k):
+            with self.subTest(mode=mode):
+                write = Mock()
+                replacement = [91, 92]
+                edited_ids = self.ids[:5] + replacement + self.ids[7:]
+                salt = self.editor.edit(
+                    self.ids, replacement, 5, 7, "source", write, recompute_suffix=mode
+                )
+                plan = write.call_args.args[0]
+                self.assertEqual(plan.destination, self.lookup(edited_ids, salt))
+                self.assertEqual(plan.source, self.lookup(self.ids, "source"))
+                self.assertIsNone(plan.suffix_ids)
+                self.assertIsNone(plan.selection)
+                self.assertEqual(plan.destination[:1], plan.source[:1])
+                self.assertNotEqual(plan.destination[1], plan.source[1])
+                self.assertEqual(plan.destination[2:], plan.source[2:])
+                self.assertEqual(plan.copy_end, 8)
+                self.assertEqual([b.ref_cnt for b in self.pages], [1] * len(self.pages))
 
     def test_recompute_privatizes_the_whole_suffix(self):
         for end, replacement in ((7, [91, 92]), (7, []), (5, [])):

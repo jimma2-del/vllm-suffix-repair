@@ -54,8 +54,14 @@ def parse_args():
         "--thresholds",
         nargs="+",
         type=float,
-        default=DEFAULT_THRESHOLDS,
-        help="Raw selection thresholds to test (default: %(default)s)",
+        help="Raw selection thresholds to test",
+    )
+    parser.add_argument(
+        "--top-k",
+        nargs="+",
+        type=int,
+        default=(),
+        help="Suffix token counts to test. Pass --thresholds to test both policies.",
     )
     for axis in ("key", "head", "layer"):
         parser.add_argument(
@@ -107,8 +113,12 @@ def parse_args():
         )
     if args.block_size is not None and args.block_size < 1:
         parser.error("--block-size must be positive")
+    if args.thresholds is None:
+        args.thresholds = () if args.top_k else DEFAULT_THRESHOLDS
     if any(not math.isfinite(value) for value in args.thresholds):
         parser.error("thresholds must be finite")
+    if any(value < 0 for value in args.top_k):
+        parser.error("--top-k values must be nonnegative")
     if "selective" in args.methods and args.q_format == "none":
         parser.error("selective repair requires a stored query cache")
     if (
@@ -124,17 +134,16 @@ def trial_variants(args):
         if method != "selective":
             yield method, False if method == "reuse" else None
             continue
+        score_options = {
+            "key_reduction": args.key_reduction,
+            "head_reduction": args.head_reduction,
+            "layer_reduction": args.layer_reduction,
+            "include_deleted": args.include_deleted,
+        }
         for threshold in dict.fromkeys(args.thresholds):
-            yield (
-                f"selective@{threshold!r}",
-                {
-                    "threshold": threshold,
-                    "key_reduction": args.key_reduction,
-                    "head_reduction": args.head_reduction,
-                    "layer_reduction": args.layer_reduction,
-                    "include_deleted": args.include_deleted,
-                },
-            )
+            yield f"selective@{threshold!r}", dict(score_options, threshold=threshold)
+        for k in dict.fromkeys(args.top_k):
+            yield f"selective@top-k={k}", dict(score_options, top_k=k)
 
 
 def git_revision():
@@ -253,7 +262,12 @@ def run_trial(llm, journal, info, prepared, sampling, variant, block_size):
                     "Cache edit would produce different IDs from the full rerun"
                 )
             record["repair_source_tokens"] = source_len
-            record["repair_suffix_tokens"] = source_len - end
+            suffix_tokens = source_len - end
+            record["repair_suffix_tokens"] = suffix_tokens
+            if selection is not None and "top_k" in selection:
+                recompute_suffix = dict(
+                    selection, top_k=min(selection["top_k"], suffix_tokens)
+                )
 
         selected_runs = None
         started = perf_counter()
@@ -354,7 +368,10 @@ def summarize(path):
             "p95_ms": latencies[math.ceil(count * 0.95) - 1] if count else None,
         }
         if (selection := rows[0].get("selection")) is not None:
-            metrics["threshold"] = selection["threshold"]
+            if "top_k" in selection:
+                metrics["top_k"] = selection["top_k"]
+            else:
+                metrics["threshold"] = selection["threshold"]
         selected_counts = [
             row["repair_selected_count"]
             for row in valid

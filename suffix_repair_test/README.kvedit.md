@@ -33,9 +33,15 @@ The default sweep tests raw selection thresholds 0.5, 32, 256, 2048, and
 16384. Use `--thresholds 32 128 512` to replace the sweep. The selector
 replays tokens whose scores are strictly above the threshold. Selection
 density depends on the model, query-cache format, and score reductions.
+
+Use `--top-k 32 128 512` to test fixed suffix token counts. Each count is
+capped at the cached suffix length, and a count of zero skips suffix replay.
+Pass `--thresholds` and `--top-k` together to compare both selection policies
+in one run.
+
 Use `--methods full reuse` to compare full recomputation and stale suffix
 reuse. Use `--methods full prefix reuse selective` to include vLLM's automatic
-prefix caching baseline in the default sweep.
+prefix caching baseline in the sweep.
 Use `--conditions derived` to select one probe. Use `--offset`, `--limit`,
 and `--repeats` to control the sample range and repetition count. The score
 reductions and query-cache format are configurable through `--help`.
@@ -61,8 +67,9 @@ normal cache lookup to reuse the unchanged prefix.
 
 The `reuse` method computes KV for the replacement tokens and keeps the
 cached suffix with zero suffix tokens replayed. The `selective` method also
-recomputes suffix tokens above the threshold. Both generate against the
-edited document with a fresh question and any partial document block.
+recomputes suffix tokens selected by the threshold or top-k policy. Both
+generate against the edited document with a fresh question and any partial
+document block.
 
 Use the `edited` rows in `summary.json` for the second-run median and p95
 latency by method, condition, and distance. Second-run latency includes
@@ -88,5 +95,6 @@ following measurements and reproduction inputs.
   length. Edit time includes returning the replay ranges. The benchmark
   expands the ranges after timing generation and flushes each stage to disk.
 - `summary.json` aggregates measured trials and reports the minimum, median,
-  and maximum suffix replay counts for `reuse` and each selective threshold.
-  Warmup trials remain in `runs.jsonl` with `warmup: true`.
+  and maximum suffix replay counts for `reuse` and each selective variant.
+  Selective rows record the requested `threshold` or `top_k` value. Warmup
+  trials remain in `runs.jsonl` with `warmup: true`.

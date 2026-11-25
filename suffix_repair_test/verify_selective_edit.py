@@ -24,7 +24,7 @@ from suffix_repair_test.selective_reference import (
 )
 from vllm import LLM, SamplingParams
 from vllm.v1.worker import kv_cache_edit as edit_worker
-from vllm.v1.worker.kv_cache_edit import _prefill, _selected_runs
+from vllm.v1.worker.kv_cache_edit import _prefill, _score_runs, _selected_runs
 
 MAX = ("max",) * 3
 
@@ -236,10 +236,30 @@ def threshold_cases(scores, suffix_start, page_size):
     return clustered, split, candidates[-1]
 
 
-def benchmark(llm, source, start, end, text, cases, fmt, repeats):
+def benchmark(cache, source, start, end, text, cases, fmt, repeats):
+    llm = cache.llm
+    inserted = len(llm.get_tokenizer().encode(text, add_special_tokens=False))
+    replacement_end = start + inserted
     options = {"reuse": (False, {}), "full": (True, {})}
-    for label, case in zip(("clustered", "fragmented", "sparsest"), cases):
-        options[label] = ("selective", {"threshold": case[0]})
+    masks = []
+    for label, (threshold, positions, runs, _) in zip(
+        ("clustered", "fragmented", "sparsest"), cases
+    ):
+        top_k = len(positions)
+        options[label] = ("selective", {"threshold": threshold})
+        top_k_label = f"{label}_top_k"
+        options[top_k_label] = ("selective", {"top_k": top_k})
+        expected = list(range(start, replacement_end)) + [
+            replacement_end + p for p in positions
+        ]
+        for variant in (label, top_k_label):
+            mode, kw = options[variant]
+            with cache.observe() as observed:
+                edit_prompt(llm, source, start, end, text, mode, **kw)
+            assert list(chain.from_iterable(observed)) == expected, variant
+        masks.append(
+            {"threshold": threshold, "top_k": top_k, "selected": top_k, "runs": runs}
+        )
     labels = list(options)
     samples = {k: [] for k in labels}
     for i in range(repeats + 1):
@@ -263,18 +283,51 @@ def benchmark(llm, source, start, end, text, cases, fmt, repeats):
                 "q_dtype": fmt,
                 "source": len(source["prompt_token_ids"]),
                 "removed": end - start,
-                "inserted": len(
-                    llm.get_tokenizer().encode(text, add_special_tokens=False)
-                ),
+                "inserted": inserted,
                 "suffix": len(source["prompt_token_ids"]) - end,
-                "masks": [
-                    {"threshold": t, "selected": len(p), "runs": r}
-                    for t, p, r, _ in cases
-                ],
+                "masks": masks,
             }
         ),
         flush=True,
     )
+
+
+@torch.inference_mode()
+def benchmark_selector(suffix_len, repeats):
+    generator = torch.Generator(device="cuda").manual_seed(178)
+    for count in (suffix_len, 4096, 32768):
+        scores = torch.randperm(count, generator=generator, device="cuda").float()
+        top_k = max(1, count // 20)
+        threshold = float(count - top_k - 1)
+        methods = [("threshold", {"threshold": threshold}), ("top_k", {"top_k": top_k})]
+        threshold_runs = _score_runs(scores, methods[0][1])
+        top_k_runs = _score_runs(scores, methods[1][1])
+        assert top_k_runs == threshold_runs
+        assert sum(end - start for start, end in top_k_runs) == top_k
+        samples = {label: [] for label, _ in methods}
+        for _ in range(repeats):
+            for label, options in methods:
+                started = perf_counter()
+                _score_runs(scores, options)
+                samples[label].append((perf_counter() - started) * 1e6)
+            methods.reverse()
+        print(
+            "SELECTOR_LATENCY",
+            json.dumps(
+                {
+                    "device": torch.cuda.get_device_name(),
+                    "torch": str(torch.__version__),
+                    "score_dtype": str(scores.dtype),
+                    "suffix": count,
+                    "top_k": top_k,
+                    "threshold": threshold,
+                    "runs": len(top_k_runs),
+                    "median_us": {k: round(median(v), 3) for k, v in samples.items()},
+                    "samples_us": samples,
+                }
+            ),
+            flush=True,
+        )
 
 
 def benchmark_fixed_masks(edit, suffix_len, repeats):
@@ -383,6 +436,12 @@ def verify_inproc(llm, src, fmt, repeats):
                 same_state(
                     cache.snapshot(edit("selective", threshold=threshold)), expected
                 )
+            if label == "equal":
+                suffix_len = len(src["prompt_token_ids"]) - end
+                same_state(cache.snapshot(edit("selective", top_k=0)), reuse)
+                same_state(
+                    cache.snapshot(edit("selective", top_k=suffix_len + 1)), full
+                )
             if label == "delete":
                 same_state(
                     cache.snapshot(
@@ -417,6 +476,9 @@ def verify_inproc(llm, src, fmt, repeats):
                 sparse = edit("selective", threshold=threshold)
                 with cache.pinned(sparse):
                     actual = cache.snapshot(sparse)
+                    same_state(
+                        cache.snapshot(edit("selective", top_k=len(offsets))), actual
+                    )
                     private = edit("selective", threshold=float("inf"))
                     cache.replay_individually(private, src, positions)
                     check_sparse(actual, reuse, cache.snapshot(private), positions, fmt)
@@ -426,7 +488,8 @@ def verify_inproc(llm, src, fmt, repeats):
                     generate_hits(llm, chained)
                     same_state(cache.snapshot(sparse), actual)
                 if repeats:
-                    benchmark(llm, src, start, end, text, cases, fmt, repeats)
+                    benchmark(cache, src, start, end, text, cases, fmt, repeats)
+                    benchmark_selector(len(scores), repeats)
                     benchmark_fixed_masks(edit, len(scores), repeats)
             if label == "contract":
                 verify_gathered(cache, src, edit, suffix_start, reuse, fmt)
@@ -536,12 +599,17 @@ def main():
     # for each MP case since cache residency is an explicit edit prerequisite.
     if not mp_client and args.tp == 1:
         verify_inproc(llm, source, args.q_format, args.repeats)
-    for threshold, mode in ((float("inf"), False), (-float("inf"), True)):
+    suffix_len = len(source["prompt_token_ids"]) - 17
+    for threshold, top_k, mode in (
+        (float("inf"), 0, False),
+        (-float("inf"), suffix_len, True),
+    ):
         llm.generate(
             source, SamplingParams(max_tokens=1, temperature=0), use_tqdm=False
         )
         expected = generate_hits(llm, edit(mode))
         assert generate_hits(llm, edit("selective", threshold=threshold)) == expected
+        assert generate_hits(llm, edit("selective", top_k=top_k)) == expected
     partial = edit(
         "selective",
         threshold=0.5,
@@ -550,6 +618,7 @@ def main():
         layer_reduction="sum",
     )
     generate_hits(llm, partial)
+    generate_hits(llm, edit("selective", top_k=5))
     generate_hits(llm, edit_prompt(llm, partial, 5, 8, "", "selective", threshold=0))
     for start, end, text in ((2, 2, ""), (84, 85, ""), (85, 85, " blue")):
         generate_hits(llm, edit("selective", start, end, text, threshold=0))
@@ -557,6 +626,10 @@ def main():
     for kw in (
         {},
         {"threshold": float("nan")},
+        {"top_k": -1},
+        {"top_k": 1.5},
+        {"top_k": True},
+        {"top_k": 1, "threshold": 0},
         {"threshold": 0, "head_reduction": "bad"},
         {"threshold": 0, "key_reduction": "bad"},
         {"threshold": 0, "layer_reduction": "bad"},

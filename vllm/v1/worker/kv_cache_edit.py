@@ -16,7 +16,7 @@ from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.ops.query_cache import QueryCache
 from vllm.v1.core.kv_cache_edit import KVCacheEdit
-from vllm.v1.engine import ScoreReduction
+from vllm.v1.engine import ScoreReduction, SuffixSelection
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
@@ -238,6 +238,22 @@ def _score_key_span(
             _accumulate(head_scores[tile], partial, reduction)
 
 
+def _score_runs(scores: torch.Tensor, options: SuffixSelection) -> list[list[int]]:
+    if "top_k" in options:
+        budget = options["top_k"]
+        scores = scores.nan_to_num(nan=-torch.inf, posinf=torch.inf, neginf=-torch.inf)
+        cutoff = scores.topk(budget, sorted=False).values.amin()
+        above = scores > cutoff
+        tied = scores == cutoff
+        # Keep the earliest tied positions so all TP ranks replay the same rows.
+        tie_rank = tied.cumsum(0, dtype=torch.int32)
+        mask = above | (tied & (tie_rank <= budget - above.sum()))
+    else:
+        mask = scores > options["threshold"]
+    mask = torch.nn.functional.pad(mask, (1, 1))
+    return (mask[1:] != mask[:-1]).nonzero().reshape(-1, 2).tolist()
+
+
 def _selected_runs(
     edit: KVCacheEdit,
     layers: dict[str, tuple[torch.Tensor, RotaryEmbedding, QueryCache | None]],
@@ -291,9 +307,7 @@ def _selected_runs(
             dist.all_reduce(by_layer, op=op, group=tp.device_group)
         _accumulate(scores, by_layer, layer_op)
 
-    mask = torch.nn.functional.pad(scores > options["threshold"], (1, 1))
-    boundaries = (mask[1:] != mask[:-1]).nonzero().reshape(-1, 2)
-    return boundaries.tolist()
+    return _score_runs(scores, options)
 
 
 @torch.inference_mode()
@@ -361,8 +375,14 @@ def write_kv_cache_edit(
 
     _prefill(runner, edit.replacement_ids, edit.start, destination, edit.block_size)
     suffix_start = edit.start + len(edit.replacement_ids)
-    if edit.suffix_ids is not None and edit.selection is None:
-        _prefill(runner, edit.suffix_ids, suffix_start, destination, edit.block_size)
+    suffix_ids = edit.suffix_ids
+    selection = edit.selection
+    if suffix_ids is not None and (
+        selection is None or selection.get("top_k", -1) >= len(suffix_ids)
+    ):
+        _prefill(runner, suffix_ids, suffix_start, destination, edit.block_size)
+        if selection is not None and return_selected_runs:
+            return [[0, len(suffix_ids)]] if suffix_ids else []
         return None
     for cache, rope, query_cache in layers.values():
         _copy_tokens(
@@ -376,13 +396,13 @@ def write_kv_cache_edit(
             edit.copy_end - suffix_start,
             query_cache,
         )
-    if edit.selection is None:
+    if selection is None:
         return None
-    assert edit.suffix_ids is not None
+    assert suffix_ids is not None
     runs = _selected_runs(edit, layers, source, destination)
     _prefill(
         runner,
-        edit.suffix_ids,
+        suffix_ids,
         suffix_start,
         destination,
         edit.block_size,

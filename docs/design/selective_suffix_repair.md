@@ -1,9 +1,11 @@
 # Selective suffix repair for `LLM.edit_kv_cache`
 
-Pass `recompute_suffix="selective"` and an explicit `threshold` to score each
-suffix token, then recompute all heads and layers for tokens strictly above
-that threshold. This requires a bound Q cache. The default reductions are
-`max`, and `include_deleted=True` scores removed keys as well as replacements.
+Pass `recompute_suffix="selective"` with either `threshold` or `top_k`.
+A threshold selects suffix tokens whose scores strictly exceed it. A top-k
+budget selects the highest-scoring suffix tokens up to that count. Both
+policies replay selected tokens through all heads and layers and require a
+bound Q cache. The default reductions are `max`, and `include_deleted=True`
+scores removed keys as well as replacements.
 The boolean modes select suffix reuse (`False`) or full suffix replay (`True`).
 [Edit worker](../../vllm/v1/worker/kv_cache_edit.py) and
 [verification plan](selective_suffix_repair_plan.md#verification-plan).
@@ -20,7 +22,7 @@ contains measured results and reproduction commands.
 ```python
 edited = llm.edit_kv_cache(
     original_token_ids, replacement_text, start, end,
-    recompute_suffix="selective", threshold=score_threshold,
+    recompute_suffix="selective", top_k=128,
     key_reduction="max", head_reduction="max", layer_reduction="max",
 )
 ```
@@ -55,11 +57,16 @@ position. Both use the same cached query content.
 
 ## Whole-token selection
 
-Aggregate the numeric layer scores for each token, then select tokens whose
-result strictly exceeds the threshold. **Max across layers is preferred.**
-With a common threshold this selects the union of the per-layer hits. A sum
-can select a token with several moderate scores and can cancel positive and
-negative scores. The two reductions therefore have different threshold scales.
+The worker aggregates layer scores before applying either selection policy.
+With max across layers, a shared threshold selects the union of the per-layer
+hits. A sum can select a token with several moderate scores and can cancel
+positive and negative scores.
+
+Top-k uses the kth-largest aggregate score as the cutoff. At that cutoff,
+earlier suffix positions take priority. It treats NaN scores as negative
+infinity. When the edit has affected keys, a budget of zero reuses the suffix
+and a budget covering the whole suffix replays it in full. Both cases skip
+scoring.
 
 Recompute selected tokens through every layer at their edited positions, with
 all heads at model precision. Each selected token attends to its complete
@@ -174,15 +181,16 @@ computed suffix Q never changes another token's selection in the same edit.
 
 | Component | Responsibility |
 | --- | --- |
-| `LLM.edit_kv_cache` | Validate the mode, explicit non-NaN threshold and reduction options, tokenize replacement text, and return edited IDs with a fresh cache salt. |
-| `SuffixSelection` and synchronous engine clients | Carry the threshold, three reductions and deletion option through in-process calls or multiprocess serialization. |
+| `LLM.edit_kv_cache` | Validate the mode, threshold or top-k budget, and reduction options, tokenize replacement text, and return edited IDs with a fresh cache salt. |
+| `SuffixSelection` and synchronous engine clients | Carry the threshold or top-k budget, three reductions, and deletion option through in-process calls or multiprocess serialization. |
 | Engine core and `KVCacheEditor` | Check prerequisites, resolve and pin source pages, allocate private destination pages and dispatch the worker RPC before publishing cache aliases. |
 | `write_kv_cache_edit` | Seed the prefix fragment, prefill replacement tokens, copy and relocate the suffix, select runs, and replay them. |
 | `QueryCache.roundtrip_keys` | Represent affected K in the stored Q format for scoring, with the same CUDA encoder used by Q writes. |
 
 The public API accepts infinite thresholds for selecting all or none of the
-finite scores. Invalid reductions, missing or NaN thresholds, and selective
-options supplied with a boolean mode raise errors. Selective mode requires
+finite scores. A top-k budget must be a nonnegative integer. The public API
+rejects invalid reductions, a NaN threshold, and selective options supplied
+with a boolean mode. Selective mode requires exactly one selection policy and
 stored Q. Worker validation additionally checks dense floating-point K/V,
 compatible 1D RoPE, bound Q geometry and the absence of shared K/V layers.
 The underlying editing restrictions are recorded in the KV editing record.
@@ -193,8 +201,8 @@ The underlying editing restrictions are recorded in the KV editing record.
 
 Selective edits reserve private pages through the suffix before computing
 the mask, including length-preserving replacements. This protects the source
-and provides writable destinations for any selection. An edit with no included
-affected keys follows the reuse path. The worker completes and synchronizes
+and provides writable destinations for any selection. An edit with zero budget
+or no included affected keys follows the reuse path. The worker completes and synchronizes
 before the editor publishes the destination. Allocation or worker failures
 release temporary references without publishing the edited cache.
 [Page planning](../../vllm/v1/core/kv_cache_edit.py) and
@@ -217,7 +225,7 @@ head operation, then folded into the suffix-length layer accumulator. Sorting
 layer names makes collective order consistent across ranks. Replicated KV
 heads still pair with each rank's distinct query heads.
 
-The implementation visits every scoring layer before thresholding. With
+The implementation visits every scoring layer before making the selection. With
 suffix length S, affected-key count E, query-head count H, head dimension D
 and L layers, scoring arithmetic scales as O(L S E H D). Tiling bounds the
 pairwise score tensor, while the per-layer accumulator still scales as O(S H).
@@ -236,7 +244,7 @@ and FP16, BF16 and FP32 source vectors.
 
 ### Fragmented replay implementation
 
-`_selected_runs` freezes the threshold mask after scoring every layer and
+`_selected_runs` freezes the selection mask after scoring every layer and
 returns sorted, half-open suffix intervals to the host. Both replay schedules
 use these intervals. An empty mask skips the suffix forward. A full mask
 prefills one contiguous run, split at the runner's token limit.

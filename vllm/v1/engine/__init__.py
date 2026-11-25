@@ -5,7 +5,7 @@ import enum
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 import msgspec
 import numpy as np
@@ -36,9 +36,10 @@ ScoreReduction = Literal["max", "sum"]
 
 
 class SuffixSelection(TypedDict):
-    """Whole-token selection options carried by the edit RPC."""
+    """Whole-token edit selection with exactly one of threshold and top_k."""
 
-    threshold: float
+    threshold: NotRequired[float]
+    top_k: NotRequired[int]
     key_reduction: ScoreReduction
     head_reduction: ScoreReduction
     layer_reduction: ScoreReduction

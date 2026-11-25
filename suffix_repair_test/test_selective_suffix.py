@@ -82,18 +82,24 @@ def fixture(
     return edit, layers, source, dest, reference
 
 
-def check_mask(fix, ops, threshold, expected):
+def check_mask(fix, ops, expected, **policy):
     edit, layers, src, dst, _ = fix
     edit.selection = SuffixSelection(
         key_reduction=ops[0],
         head_reduction=ops[1],
         layer_reduction=ops[2],
-        threshold=threshold,
         include_deleted=True,
+        **policy,
     )
     got = _selected_runs(edit, layers, src, dst)
     selected = [p for a, b in got for p in range(a, b)]
-    assert selected == expected.nonzero().flatten().tolist(), (ops, threshold, got)
+    assert selected == expected.nonzero().flatten().tolist(), (ops, policy, got)
+
+
+def check_top_k(fix, ops, scores, k):
+    expected = torch.zeros_like(scores, dtype=torch.bool)
+    expected[scores.argsort(descending=True, stable=True)[:k]] = True
+    check_mask(fix, ops, expected, top_k=k)
 
 
 def tp_rank(rank, rendezvous, backend):
@@ -119,9 +125,13 @@ def tp_rank(rank, rendezvous, backend):
                 for ops in REDUCTIONS:
                     scores = reduce_scores(refs, ops)
                     threshold = midpoint(scores)
-                    check_mask(shards[rank], ops, threshold, scores > threshold)
+                    check_mask(
+                        shards[rank], ops, scores > threshold, threshold=threshold
+                    )
+                ops = ("max",) * 3
+                scores = reduce_scores(refs, ops)
+                check_top_k(shards[rank], ops, scores, 5)
                 if replicated:
-                    scores = reduce_scores(refs, ("max",) * 3)
                     threshold = midpoint(scores)
                     assert threshold > 0 and (scores > threshold).any()
                     assert not (
@@ -142,12 +152,15 @@ class SelectiveScoringTest(unittest.TestCase):
                         for ops in REDUCTIONS:
                             scores = reduce_scores(fix[-1], ops)
                             threshold = midpoint(scores)
-                            check_mask(fix, ops, threshold, scores > threshold)
+                            check_mask(
+                                fix, ops, scores > threshold, threshold=threshold
+                            )
             fix = fixture(device, "int8", 2, 129, 130, 257)
             for ops in REDUCTIONS:
                 scores = reduce_scores(fix[-1], ops)
                 threshold = midpoint(scores)
-                check_mask(fix, ops, threshold, scores > threshold)
+                check_mask(fix, ops, scores > threshold, threshold=threshold)
+                check_top_k(fix, ops, scores, 19)
 
     def test_cpu(self):
         self.matrix("cpu")
@@ -190,8 +203,11 @@ class SelectiveScoringTest(unittest.TestCase):
             for ops in REDUCTIONS:
                 score = -7 * (3 if ops[0] == "sum" else 1)
                 score *= (4 if ops[1] == "sum" else 1) * (2 if ops[2] == "sum" else 1)
-                check_mask(fix, ops, score, torch.zeros(3, dtype=torch.bool))
-                check_mask(fix, ops, score - 1, torch.ones(3, dtype=torch.bool))
+                check_mask(fix, ops, torch.zeros(3, dtype=torch.bool), threshold=score)
+                check_mask(
+                    fix, ops, torch.ones(3, dtype=torch.bool), threshold=score - 1
+                )
+                check_mask(fix, ops, torch.tensor([True, True, False]), top_k=2)
 
     def collective(self, backend):
         with tempfile.TemporaryDirectory() as folder:
