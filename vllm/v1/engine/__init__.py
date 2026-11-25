@@ -45,6 +45,13 @@ class SuffixSelection(TypedDict):
     include_deleted: bool
 
 
+class KVCacheEditResult(TypedDict):
+    """Cache salt and half-open ranges relative to the edited suffix."""
+
+    cache_salt: str
+    selected_runs: list[list[int]]
+
+
 # These are possible values of RequestOutput.finish_reason,
 # so form part of the external API.
 FINISH_REASON_STRINGS = ("stop", "length", "abort", "error", "repetition")

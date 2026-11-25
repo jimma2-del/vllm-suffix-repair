@@ -46,6 +46,7 @@ from vllm.v1.engine import (
     EngineCoreReadyResponse,
     EngineCoreRequest,
     EngineCoreRequestType,
+    KVCacheEditResult,
     PauseMode,
     ReconfigureDistributedRequest,
     ReconfigureRankType,
@@ -214,7 +215,8 @@ class EngineCoreClient(ABC):
         end: int,
         cache_salt: str | None,
         recompute_suffix: bool | SuffixSelection = False,
-    ) -> str:
+        return_selected_runs: bool = False,
+    ) -> str | KVCacheEditResult:
         raise NotImplementedError
 
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
@@ -464,9 +466,16 @@ class InprocClient(EngineCoreClient):
         end: int,
         cache_salt: str | None,
         recompute_suffix: bool | SuffixSelection = False,
-    ) -> str:
+        return_selected_runs: bool = False,
+    ) -> str | KVCacheEditResult:
         return self.engine_core.edit_kv_cache(
-            original_ids, replacement_ids, start, end, cache_salt, recompute_suffix
+            original_ids,
+            replacement_ids,
+            start,
+            end,
+            cache_salt,
+            recompute_suffix,
+            return_selected_runs,
         )
 
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
@@ -1131,7 +1140,8 @@ class SyncMPClient(MPClient):
         end: int,
         cache_salt: str | None,
         recompute_suffix: bool | SuffixSelection = False,
-    ) -> str:
+        return_selected_runs: bool = False,
+    ) -> str | KVCacheEditResult:
         return self.call_utility(
             "edit_kv_cache",
             original_ids,
@@ -1140,6 +1150,7 @@ class SyncMPClient(MPClient):
             end,
             cache_salt,
             recompute_suffix,
+            return_selected_runs,
         )
 
     def add_lora(self, lora_request: LoRARequest) -> bool:

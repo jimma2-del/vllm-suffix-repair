@@ -300,7 +300,9 @@ def _selected_runs(
 def write_kv_cache_edit(
     runner: GPUModelRunner | GPUModelRunnerV2,
     edit: KVCacheEdit,
-) -> None:
+    *,
+    return_selected_runs: bool = False,
+) -> list[list[int]] | None:
     model = runner.get_model()
     context = runner.vllm_config.compilation_config.static_forward_context
     layers = {}
@@ -361,7 +363,7 @@ def write_kv_cache_edit(
     suffix_start = edit.start + len(edit.replacement_ids)
     if edit.suffix_ids is not None and edit.selection is None:
         _prefill(runner, edit.suffix_ids, suffix_start, destination, edit.block_size)
-        return
+        return None
     for cache, rope, query_cache in layers.values():
         _copy_tokens(
             cache,
@@ -374,13 +376,16 @@ def write_kv_cache_edit(
             edit.copy_end - suffix_start,
             query_cache,
         )
-    if edit.selection is not None:
-        assert edit.suffix_ids is not None
-        _prefill(
-            runner,
-            edit.suffix_ids,
-            suffix_start,
-            destination,
-            edit.block_size,
-            runs=_selected_runs(edit, layers, source, destination),
-        )
+    if edit.selection is None:
+        return None
+    assert edit.suffix_ids is not None
+    runs = _selected_runs(edit, layers, source, destination)
+    _prefill(
+        runner,
+        edit.suffix_ids,
+        suffix_start,
+        destination,
+        edit.block_size,
+        runs=runs,
+    )
+    return runs if return_selected_runs else None

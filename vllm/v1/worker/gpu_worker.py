@@ -1156,14 +1156,20 @@ class Worker(WorkerBase):
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
 
-    def write_kv_cache_edit(self, edit: "KVCacheEdit") -> None:
+    def write_kv_cache_edit(
+        self, edit: "KVCacheEdit", return_selected_runs: bool = False
+    ) -> list[list[int]] | None:
         from vllm.config import set_current_vllm_config
         from vllm.v1.worker.kv_cache_edit import write_kv_cache_edit
 
         self.synchronize_device()
         try:
             with set_current_vllm_config(self.vllm_config):
-                write_kv_cache_edit(self.model_runner, edit)
+                return write_kv_cache_edit(
+                    self.model_runner,
+                    edit,
+                    return_selected_runs=return_selected_runs,
+                )
         finally:
             # The scheduler can recycle these pages as soon as this RPC returns.
             self.synchronize_device()

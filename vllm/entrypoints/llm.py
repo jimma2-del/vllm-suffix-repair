@@ -925,6 +925,7 @@ class LLM(
         salt = self.llm_engine.engine_core.edit_kv_cache(
             original, replacement, start, end, cache_salt, policy
         )
+        assert isinstance(salt, str)
         return {
             "prompt_token_ids": original[:start] + replacement + original[end:],
             "cache_salt": salt,

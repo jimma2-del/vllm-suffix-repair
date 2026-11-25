@@ -53,6 +53,7 @@ from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.utils.watch_dog import get_watch_dog, start_watch_dog
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+from vllm.v1.core.kv_cache_edit import KVCacheEdit
 from vllm.v1.core.kv_cache_planning import get_kv_cache_configs
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -75,6 +76,7 @@ from vllm.v1.engine import (
     EngineCoreRequest,
     EngineCoreRequestType,
     FinishReason,
+    KVCacheEditResult,
     PauseMode,
     ReconfigureDistributedRequest,
     ReconfigureRankType,
@@ -916,7 +918,8 @@ class EngineCore:
         end: int,
         cache_salt: str | None,
         recompute_suffix: bool | SuffixSelection = False,
-    ) -> str:
+        return_selected_runs: bool = False,
+    ) -> str | KVCacheEditResult:
         manager = getattr(self.scheduler, "kv_cache_manager", None)
         editor = getattr(manager, "editor", None)
         if editor is None:
@@ -938,15 +941,32 @@ class EngineCore:
             raise ValueError(
                 "Replacement contains a token outside the model vocabulary."
             )
-        return editor.edit(
+        selected_runs: list[list[int]] = []
+
+        def write(plan: KVCacheEdit) -> None:
+            nonlocal selected_runs
+            results = self.collective_rpc(
+                "write_kv_cache_edit",
+                args=(plan, True) if return_selected_runs else (plan,),
+            )
+            if return_selected_runs and plan.selection is not None:
+                # All tensor-parallel ranks replay the same reduced mask.
+                runs = results[0]
+                assert runs is not None
+                selected_runs = runs
+
+        salt = editor.edit(
             original_ids,
             replacement_ids,
             start,
             end,
             cache_salt,
-            lambda plan: self.collective_rpc("write_kv_cache_edit", args=(plan,)),
+            write,
             recompute_suffix=recompute_suffix,
         )
+        if return_selected_runs:
+            return KVCacheEditResult(cache_salt=salt, selected_runs=selected_runs)
+        return salt
 
     def _set_kv_connector_handshake_metadata(self) -> None:
         # If a KV connector is initialized for scheduler, we want to collect
